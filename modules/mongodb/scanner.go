@@ -320,6 +320,7 @@ func (scanner *Scanner) Scan(target zgrab2.ScanTarget) (zgrab2.ScanStatus, inter
 	defer scan.Close()
 	try = 0
 	for try < scanner.config.MaxTries {
+		try++
 		result = scan.result
 		result.IsMaster, err = getIsMaster(scan.conn)
 		if err != nil {
