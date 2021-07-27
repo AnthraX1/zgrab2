@@ -17,6 +17,7 @@ type Module struct {
 // Flags contains mongodb-specific command-line flags.
 type Flags struct {
 	zgrab2.BaseFlags
+	MaxTries int `long:"max-tries" default:"1" description:"Number of tries for timeouts and connection errors before giving up."`
 }
 
 // Scanner implements the zgrab2.Scanner interface
@@ -297,18 +298,37 @@ func getIsMaster(conn *Connection) (*IsMaster_t, error) {
 
 // Scan connects to a host and performs a scan.
 func (scanner *Scanner) Scan(target zgrab2.ScanTarget) (zgrab2.ScanStatus, interface{}, error) {
-	scan, err := scanner.StartScan(&target)
+	try := 0
+	var (
+		scan   *scan
+		err    error
+		result *Result
+	)
+
+	for try < scanner.config.MaxTries {
+		try++
+		scan, err = scanner.StartScan(&target)
+		if err != nil {
+			continue
+			//return zgrab2.TryGetScanStatus(err), nil, err
+		}
+		break
+	}
 	if err != nil {
 		return zgrab2.TryGetScanStatus(err), nil, err
 	}
 	defer scan.Close()
-
-	result := scan.result
-	result.IsMaster, err = getIsMaster(scan.conn)
+	for try < scanner.config.MaxTries {
+		result = scan.result
+		result.IsMaster, err = getIsMaster(scan.conn)
+		if err != nil {
+			continue
+		}
+		break
+	}
 	if err != nil {
 		return zgrab2.SCAN_PROTOCOL_ERROR, nil, err
 	}
-
 	var query []byte
 	var resplen_offset int
 	var resp_offset int
