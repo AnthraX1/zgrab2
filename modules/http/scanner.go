@@ -427,9 +427,15 @@ func getHTTPURL(https bool, host string, port uint16, endpoint string) string {
 	} else {
 		proto = "http"
 	}
-	if protoToPort[proto] == port {
+	if protoToPort[proto] == port && strings.Contains(host, ":") {
+		//If the host has a ":" in it, assume literal IPv6 address
+		return proto + "://[" + host + "]" + endpoint
+	} else if protoToPort[proto] == port {
+		//Otherwise, just concatenate host and endpoint
 		return proto + "://" + host + endpoint
 	}
+
+	//For non-default ports, net.JoinHostPort will handle brackets for IPv6 literals
 	return proto + "://" + net.JoinHostPort(host, strconv.FormatUint(uint64(port), 10)) + endpoint
 }
 
@@ -550,6 +556,12 @@ func (scan *scan) Grab() *zgrab2.ScanError {
 		if readLen < sliceLen {
 			sliceLen = readLen
 		}
+
+		bodyTextLen := int64(len(bodyText))
+		if bodyTextLen < sliceLen {
+			sliceLen = bodyTextLen
+		}
+
 		sliceBuf := bodyText[:sliceLen]
 		if strings.Contains(sliceBuf, "The plain HTTP request was sent to HTTPS port") ||
 			strings.Contains(sliceBuf, "You're speaking plain HTTP") ||
@@ -597,7 +609,7 @@ func (scanner *Scanner) Scan(t zgrab2.ScanTarget) (zgrab2.ScanStatus, interface{
 			defer retry.Cleanup()
 			retryError := retry.Grab()
 			if retryError != nil {
-				return retryError.Unpack(&retry.results)
+				return err.Unpack(&scan.results)
 			}
 			return zgrab2.SCAN_SUCCESS, &retry.results, nil
 		}
