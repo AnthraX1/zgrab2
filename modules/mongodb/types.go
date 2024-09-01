@@ -6,6 +6,7 @@ import (
 	"io"
 
 	"github.com/zmap/zgrab2"
+	"io"
 )
 
 const (
