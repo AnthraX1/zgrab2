@@ -39,6 +39,7 @@ type Flags struct {
 	DoInline         bool   `long:"inline" description:"Send commands using the inline syntax"`
 	Verbose          bool   `long:"verbose" description:"More verbose logging, include debug fields in the scan results"`
 	UseTLS           bool   `long:"use-tls" description:"Sends probe with a TLS connection. Loads TLS module command options."`
+	MaxTries         int    `long:"max-tries" default:"1" description:"Number of tries for timeouts and connection errors before giving up."`
 	zgrab2.TLSFlags
 }
 
@@ -407,7 +408,20 @@ func convToUint32(s string) uint32 {
 // is scraped from it.
 func (scanner *Scanner) Scan(target zgrab2.ScanTarget) (zgrab2.ScanStatus, interface{}, error) {
 	// ping, info, quit
-	scan, err := scanner.StartScan(&target)
+	try := 0
+	var (
+		scan *scan
+		err  error
+	)
+	for try < scanner.config.MaxTries {
+		try++
+		scan, err = scanner.StartScan(&target)
+		if err != nil {
+			continue
+			//return zgrab2.TryGetScanStatus(err), nil, err
+		}
+		break
+	}
 	if err != nil {
 		return zgrab2.TryGetScanStatus(err), nil, err
 	}
