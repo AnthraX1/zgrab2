@@ -49,10 +49,11 @@ type Flags struct {
 	Method          string `long:"method" default:"GET" description:"Set HTTP request method type"`
 	Endpoint        string `long:"endpoint" default:"/" description:"Send an HTTP request to an endpoint"`
 	FailHTTPToHTTPS bool   `long:"fail-http-to-https" description:"Trigger retry-https logic on known HTTP/400 protocol mismatch responses"`
-	UserAgent       string `long:"user-agent" default:"Mozilla/5.0 zgrab/0.x" description:"Set a custom user agent"`
+	UserAgent       string `long:"user-agent" default:"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:129.0) Gecko/20100101 Firefox/129.0" description:"Set a custom user agent"`
 	RetryHTTPS      bool   `long:"retry-https" description:"If the initial request fails, reconnect and try with HTTPS."`
 	MaxSize         int    `long:"max-size" default:"256" description:"Max kilobytes to read in response to an HTTP request"`
 	MaxRedirects    int    `long:"max-redirects" default:"0" description:"Max number of redirects to follow"`
+	MaxTries        int    `long:"max-tries" default:"1" description:"Number of tries for timeouts and connection errors before giving up."`
 
 	// FollowLocalhostRedirects overrides the default behavior to return
 	// ErrRedirLocalhost whenever a redirect points to localhost.
@@ -619,20 +620,31 @@ func (scan *scan) Grab() *zgrab2.ScanError {
 // the target. If the scanner is configured to follow redirects, this may entail
 // multiple TCP connections to hosts other than target.
 func (scanner *Scanner) Scan(t zgrab2.ScanTarget) (zgrab2.ScanStatus, interface{}, error) {
-	scan := scanner.newHTTPScan(&t, scanner.config.UseHTTPS)
-	defer scan.Cleanup()
-	err := scan.Grab()
-	if err != nil {
-		if scanner.config.RetryHTTPS && !scanner.config.UseHTTPS {
-			scan.Cleanup()
-			retry := scanner.newHTTPScan(&t, true)
-			defer retry.Cleanup()
-			retryError := retry.Grab()
-			if retryError != nil {
-				return err.Unpack(&scan.results)
+	var (
+		err  *zgrab2.ScanError
+		scan *scan
+	)
+
+	for i := 0; i < scanner.config.MaxTries; i++ {
+		scan = scanner.newHTTPScan(&t, scanner.config.UseHTTPS)
+		defer scan.Cleanup()
+		err = scan.Grab()
+		if err != nil {
+			if scanner.config.RetryHTTPS && !scanner.config.UseHTTPS {
+				scan.Cleanup()
+				retry := scanner.newHTTPScan(&t, true)
+				defer retry.Cleanup()
+				retryError := retry.Grab()
+				if retryError != nil {
+					continue
+				}
+				return zgrab2.SCAN_SUCCESS, &retry.results, nil
 			}
-			return zgrab2.SCAN_SUCCESS, &retry.results, nil
+			continue
 		}
+		return zgrab2.SCAN_SUCCESS, &scan.results, nil
+	}
+	if err != nil {
 		return err.Unpack(&scan.results)
 	}
 	return zgrab2.SCAN_SUCCESS, &scan.results, nil
