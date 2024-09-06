@@ -33,9 +33,9 @@ type Scanner struct {
 }
 
 type connectionTune struct {
-	ChannelMax int `json:"channel_max"`
-	FrameMax   int `json:"frame_max"`
-	Heartbeat  int `json:"heartbeat"`
+	ChannelMax uint16 `json:"channel_max"`
+	FrameMax   int    `json:"frame_max"`
+	Heartbeat  int    `json:"heartbeat"`
 }
 
 // https://www.rabbitmq.com/amqp-0-9-1-reference#connection.start.server-properties
