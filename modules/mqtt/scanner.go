@@ -1,0 +1,284 @@
+package mqtt
+
+import (
+	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+
+	"github.com/zmap/zgrab2"
+)
+
+// ScanResults is the output of the scan.
+type ScanResults struct {
+	SessionPresent    bool           `json:"session_present,omitempty"`
+	ConnectReturnCode byte           `json:"connect_return_code,omitempty"`
+	Response          string         `json:"response,omitempty"`
+	TLSLog            *zgrab2.TLSLog `json:"tls,omitempty"`
+}
+
+// Flags are the MQTT-specific command-line flags.
+type Flags struct {
+	zgrab2.BaseFlags
+	zgrab2.TLSFlags
+
+	V5                bool `long:"v5" description:"Scanning MQTT v5.0. Otherwise scanning MQTT v3.1.1"`
+	UseTLS            bool `long:"tls" description:"Use TLS for the MQTT connection"`
+	AllowTLSDowngrade bool `long:"allow-tls-downgrade" description:"If --tls is enabled and the TLS handshake fails, fall back to plaintext instead of aborting. Requires --tls."`
+}
+
+func NewModule() *zgrab2.TypedModule[Flags, Scanner, *Scanner] {
+	return zgrab2.NewTypedModule[Flags, Scanner, *Scanner]("mqtt", "Message Queuing Telemetry Transport (MQTT)", "Perform an MQTT scan", 1883)
+}
+
+// Scanner implements the zgrab2.Scanner interface, and holds the state
+// for a single scan.
+type Scanner struct {
+	zgrab2.BaseScanner
+	config *Flags
+}
+
+// Connection holds the state for a single connection to the MQTT server.
+type Connection struct {
+	conn    net.Conn
+	config  *Flags
+	results ScanResults
+}
+
+// Validate flags
+func (f Flags) Validate(_ []string) error {
+	if f.AllowTLSDowngrade && !f.UseTLS {
+		return errors.New("--allow-tls-downgrade requires --tls")
+	}
+	return nil
+}
+
+// Init initializes the Scanner instance with the flags from the command line.
+func (scanner *Scanner) Init(flags zgrab2.ScanFlags) error {
+	f, _ := flags.(*Flags)
+	scanner.config = f
+	scanner.SetBaseFlags(&f.BaseFlags)
+	scanner.DialerGroupConfig = &zgrab2.DialerGroupConfig{
+		TransportAgnosticDialerProtocol: zgrab2.TransportTCP,
+		BaseFlags:                       &f.BaseFlags,
+		TLSEnabled:                      f.UseTLS,
+		TLSFlags:                        &f.TLSFlags,
+		NeedSeparateL4Dialer:            f.AllowTLSDowngrade,
+	}
+	return nil
+}
+
+// SendMQTTConnectPacket constructs and sends an MQTT CONNECT packet to the server.
+func (mqtt *Connection) SendMQTTConnectPacket(v5 bool) error {
+	var packet []byte
+	if v5 {
+		packet = []byte{
+			// Fixed Header
+			0x10, // Control Packet Type (CONNECT) and flags
+			0x17, // Remaining Length (23 bytes)
+
+			// Variable Header
+			0x00, 0x04, 'M', 'Q', 'T', 'T', // Protocol Name
+			0x05,       // Protocol Level (MQTT v5.0)
+			0x02,       // Connect Flags (Clean Start)
+			0x00, 0x3C, // Keep Alive (60 seconds)
+
+			// Properties
+			0x00, // Properties Length (0)
+
+			// Payload
+			0x00, 0x0A, 'M', 'Q', 'T', 'T', 'C', 'l', 'i', 'e', 'n', 't', // Client Identifier
+		}
+	} else {
+		packet = []byte{
+			// Fixed Header
+			0x10, // Control Packet Type (CONNECT) and flags
+			0x16, // Remaining Length (22 bytes)
+
+			// Variable Header
+			0x00, 0x04, 'M', 'Q', 'T', 'T', // Protocol Name
+			0x04,       // Protocol Level (MQTT v3.1.1)
+			0x02,       // Connect Flags (Clean Start)
+			0x00, 0x3C, // Keep Alive (60 seconds)
+
+			// Payload
+			0x00, 0x0A, 'M', 'Q', 'T', 'T', 'C', 'l', 'i', 'e', 'n', 't', // Client Identifier
+		}
+	}
+	_, err := mqtt.conn.Write(packet)
+	return err
+}
+
+// ReadMQTTv3Packet reads and parses the CONNACK packet from the server.
+func (mqtt *Connection) ReadMQTTv3Packet() error {
+	response := make([]byte, 4)
+	_, err := mqtt.conn.Read(response)
+	if err != nil {
+		return err
+	}
+
+	mqtt.results.Response = fmt.Sprintf("%X", response)
+
+	// DISCONNECT packet
+	if ((response[0] & 0xF0) == 0xE0) && (response[1] == 0x00) {
+		return nil
+	}
+
+	// Check if the response is a valid CONNACK packet
+	if response[0] != 0x20 || response[1] != 0x02 {
+		return errors.New("invalid CONNACK packet")
+	}
+
+	mqtt.results.SessionPresent = (response[2] & 0x01) == 0x01
+	mqtt.results.ConnectReturnCode = response[3]
+
+	return nil
+}
+
+// ReadMQTTv5Packet reads and parses the CONNACK or DISCONNECT packet from the server for MQTT v5.0.
+func (mqtt *Connection) ReadMQTTv5Packet() error {
+	// Read the first byte to determine the packet type
+	firstByte := make([]byte, 1)
+	_, err := io.ReadFull(mqtt.conn, firstByte)
+	if err != nil {
+		return err
+	}
+
+	packetType := firstByte[0] >> 4
+
+	// Read the remaining length
+	remainingLengthBytes, err := readVariableByteInteger(mqtt.conn)
+	if err != nil {
+		return err
+	}
+
+	// Convert remaining length bytes to integer
+	remainingLength, _ := binary.Uvarint(remainingLengthBytes)
+
+	// Allocate the packet buffer with the correct size
+	packet := make([]byte, 1+len(remainingLengthBytes)+int(remainingLength))
+	packet[0] = firstByte[0]
+	copy(packet[1:], remainingLengthBytes)
+
+	// Read the rest of the packet
+	_, err = io.ReadFull(mqtt.conn, packet[1+len(remainingLengthBytes):])
+	if err != nil {
+		return err
+	}
+
+	// Store the original response
+	mqtt.results.Response = fmt.Sprintf("%X", packet)
+
+	// Process the packet based on its type
+	switch packetType {
+	case 2: // CONNACK
+		return mqtt.processConnAck(packet)
+	case 14: // DISCONNECT
+		return mqtt.processDisconnect(packet)
+	default:
+		return fmt.Errorf("unexpected packet type: %d", packetType)
+	}
+}
+
+func (mqtt *Connection) processConnAck(packet []byte) error {
+	if len(packet) < 4 {
+		return errors.New("invalid CONNACK packet length")
+	}
+
+	mqtt.results.SessionPresent = (packet[2] & 0x01) == 0x01
+	mqtt.results.ConnectReturnCode = packet[3]
+
+	// Process properties if present
+	if len(packet) > 4 {
+		propertiesLength, n := binary.Uvarint(packet[4:])
+		propertiesStart := 4 + n
+		propertiesEnd := propertiesStart + int(propertiesLength)
+
+		if propertiesEnd > len(packet) {
+			return errors.New("invalid properties length in CONNACK")
+		}
+	}
+
+	return nil
+}
+
+func (mqtt *Connection) processDisconnect(packet []byte) error {
+	if len(packet) < 2 {
+		return errors.New("invalid DISCONNECT packet length")
+	}
+
+	// Process properties if present
+	if len(packet) > 3 {
+		propertiesLength, n := binary.Uvarint(packet[3:])
+		propertiesStart := 3 + n
+		propertiesEnd := propertiesStart + int(propertiesLength)
+
+		if propertiesEnd > len(packet) {
+			return errors.New("invalid properties length in DISCONNECT")
+		}
+	}
+
+	return nil
+}
+
+func readVariableByteInteger(r io.Reader) ([]byte, error) {
+	var result []byte
+	for i := 0; i < 4; i++ {
+		b := make([]byte, 1)
+		_, err := r.Read(b)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, b[0])
+		if b[0]&0x80 == 0 {
+			break
+		}
+	}
+	if len(result) == 4 && result[3]&0x80 != 0 {
+		return nil, errors.New("invalid variable byte integer")
+	}
+	return result, nil
+}
+
+// Scan performs the configured scan on the MQTT server.
+func (scanner *Scanner) Scan(ctx context.Context, dialGroup *zgrab2.DialerGroup, target *zgrab2.ScanTarget) (zgrab2.ScanStatus, any, error) {
+	var (
+		conn net.Conn
+		err  error
+	)
+
+	if scanner.config.AllowTLSDowngrade {
+		conn, _, err = dialGroup.DialTLSDowngrade(ctx, target, true)
+	} else {
+		conn, err = dialGroup.Dial(ctx, target)
+	}
+	if err != nil {
+		return zgrab2.TryGetScanStatus(err), nil, fmt.Errorf("error opening connection to target %s: %w", target.String(), err)
+	}
+	defer zgrab2.CloseConnAndHandleError(conn)
+
+	mqtt := Connection{conn: conn, config: scanner.config}
+
+	if tlsConn, ok := conn.(*zgrab2.TLSConnection); ok {
+		// if the passed in connection is a TLS connection, try to grab the log
+		mqtt.results.TLSLog = tlsConn.GetLog()
+	}
+
+	if err = mqtt.SendMQTTConnectPacket(scanner.config.V5); err != nil {
+		return zgrab2.TryGetScanStatus(err), nil, fmt.Errorf("error sending CONNECT packet to target %s: %w", target.String(), err)
+	}
+
+	if scanner.config.V5 {
+		err = mqtt.ReadMQTTv5Packet()
+	} else {
+		err = mqtt.ReadMQTTv3Packet()
+	}
+
+	if err != nil {
+		return zgrab2.TryGetScanStatus(err), &mqtt.results, fmt.Errorf("error reading CONNACK packet to target %s: %w", target.String(), err)
+	}
+
+	return zgrab2.SCAN_SUCCESS, &mqtt.results, nil
+}

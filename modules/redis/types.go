@@ -11,6 +11,16 @@ import (
 	"github.com/zmap/zgrab2"
 )
 
+const (
+	// maxArrayElements caps the number of elements in a single Redis array
+	// to prevent OOM from malicious servers sending huge element counts.
+	maxArrayElements = 1_000_000
+
+	// maxRecursionDepth limits nesting of Redis arrays to prevent stack
+	// overflow from deeply nested responses.
+	maxRecursionDepth = 32
+)
+
 var (
 	// ErrInvalidData is returned when the server returns data that cannot be
 	// interpreted as a valid Redis value.
@@ -23,6 +33,9 @@ var (
 	// ErrBadLength is returned when an invalid length value is found (e.g. a
 	// negative length or longer than expected).
 	ErrBadLength = errors.New("bad length")
+
+	// ErrMaxDepthExceeded is returned when nested arrays exceed maxRecursionDepth.
+	ErrMaxDepthExceeded = errors.New("max recursion depth exceeded")
 )
 
 // RedisType is a human readable type identifier for redis data
@@ -170,9 +183,8 @@ func (RedisArray) Type() RedisType {
 // Encode returns the encoding of the array, e.g.
 // "*<base10Size>\r\n<element 1><element 2>..."
 func (array RedisArray) Encode() []byte {
-	var ret []byte
 	prefix := fmt.Sprintf("*%d\r\n", len(array))
-	ret = append(ret, []byte(prefix)...)
+	ret := []byte(prefix)
 	for _, item := range array {
 		ret = append(ret, item.Encode()...)
 	}
@@ -230,7 +242,10 @@ func (conn *Connection) readBulkString() (RedisValue, error) {
 	if err != nil {
 		return nil, err
 	}
-	size := _size.(Integer)
+	size, ok := _size.(Integer)
+	if !ok {
+		return nil, fmt.Errorf("could not parse size as integer: %w", ErrInvalidData)
+	}
 	if size == -1 {
 		return NullValue, nil
 	}
@@ -242,7 +257,7 @@ func (conn *Connection) readBulkString() (RedisValue, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !(body[size] == '\r' && body[size+1] == '\n') {
+	if body[size] != '\r' || body[size+1] != '\n' {
 		return nil, ErrInvalidData
 	}
 	return BulkString(body[:size]), nil
@@ -266,11 +281,15 @@ func (conn *Connection) readSimpleString() (RedisValue, error) {
 func (conn *Connection) readInt() (int64, error) {
 	ret, err := conn.readSimpleString()
 	if err != nil {
-		return -1, err
+		return -1, fmt.Errorf("could not read data as string from conn: %w", err)
 	}
-	parsed, err := strconv.ParseInt(string(ret.(SimpleString)), 10, 64)
+	str, ok := ret.(SimpleString)
+	if !ok {
+		return -1, fmt.Errorf("could not parse data as string: %w", ErrInvalidData)
+	}
+	parsed, err := strconv.ParseInt(string(str), 10, 64)
 	if err != nil {
-		return -1, ErrInvalidData
+		return -1, fmt.Errorf("could not parse string as int: %w", err)
 	}
 	return parsed, nil
 }
@@ -304,34 +323,31 @@ func (conn *Connection) readErrorMessage() (RedisValue, error) {
 // type identifier ("*") has already been consumed.
 // The array is returned, and the next read will start at the first byte
 // following the terminal LF of the array's terminal element.
-func (conn *Connection) readRedisArray() (RedisValue, error) {
+func (conn *Connection) readRedisArray(depth int) (RedisValue, error) {
 	numElements, err := conn.readInt()
 	if err != nil {
 		return nil, err
 	}
+	if numElements < 0 || numElements > maxArrayElements {
+		return nil, ErrBadLength
+	}
 	ret := make(RedisArray, numElements)
 	var i int64
 	for i = 0; i < numElements; i++ {
-		ret[i], err = conn.ReadRedisValue()
+		ret[i], err = conn.readRedisValueDepth(depth + 1)
 		if err != nil {
-			return nil, err
+			// Return partial array with what we collected so far
+			return ret[:i], err
 		}
 	}
 	return ret, nil
 }
-
-// redisDataReader is a function that reads a RedisValue from a connection.
-type redisDataReader func(*Connection) (RedisValue, error)
-
-// readers is a map of type identifier character to the reader for that type
-var readers map[byte]redisDataReader
 
 // Connection holds the state for a single connection within a scan
 type Connection struct {
 	scanner *Scanner
 	conn    net.Conn
 	buffer  []byte
-	isSSL   bool
 }
 
 // write writes data to the connection, and returns an error if the write fails
@@ -402,32 +418,39 @@ func (conn *Connection) WriteRedisValue(value RedisValue) error {
 // If the first byte is not a recognized type identifier, ErrInvalidData
 // is returned.
 func (conn *Connection) ReadRedisValue() (RedisValue, error) {
-	if readers == nil {
-		readers = map[byte]redisDataReader{
-			'+': func(conn *Connection) (RedisValue, error) { return conn.readSimpleString() },
-			':': func(conn *Connection) (RedisValue, error) { return conn.readInteger() },
-			'-': func(conn *Connection) (RedisValue, error) { return conn.readErrorMessage() },
-			'$': func(conn *Connection) (RedisValue, error) { return conn.readBulkString() },
-			'*': func(conn *Connection) (RedisValue, error) { return conn.readRedisArray() },
-		}
+	return conn.readRedisValueDepth(0)
+}
+
+// readRedisValueDepth reads a RedisValue with recursion depth tracking.
+func (conn *Connection) readRedisValueDepth(depth int) (RedisValue, error) {
+	if depth > maxRecursionDepth {
+		return nil, ErrMaxDepthExceeded
 	}
 	v, err := conn.read(1)
 	if err != nil {
 		return nil, err
 	}
-	ch := v[0]
-	reader, ok := readers[ch]
-	if !ok {
+	switch v[0] {
+	case '+':
+		return conn.readSimpleString()
+	case ':':
+		return conn.readInteger()
+	case '-':
+		return conn.readErrorMessage()
+	case '$':
+		return conn.readBulkString()
+	case '*':
+		return conn.readRedisArray(depth)
+	default:
 		return nil, ErrInvalidData
 	}
-	return reader(conn)
 }
 
 func (conn *Connection) GetTLSLog() *zgrab2.TLSLog {
-	if !conn.isSSL {
-		return nil
+	if tlsConn, ok := conn.conn.(*zgrab2.TLSConnection); ok {
+		return tlsConn.GetLog()
 	}
-	return conn.conn.(*zgrab2.TLSConnection).GetLog()
+	return nil
 }
 
 type CustomResponse struct {

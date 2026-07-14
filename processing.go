@@ -1,12 +1,17 @@
 package zgrab2
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"net"
+	"runtime/debug"
 	"sync"
 
 	log "github.com/sirupsen/logrus"
+	"github.com/zmap/zcrypto/tls"
+
 	"github.com/zmap/zgrab2/lib/output"
 )
 
@@ -16,6 +21,7 @@ type Grab struct {
 	Port   uint                    `json:"port,omitempty"`
 	Domain string                  `json:"domain,omitempty"`
 	Data   map[string]ScanResponse `json:"data,omitempty"`
+	Error  string                  `json:"error,omitempty"` // an error that affects the entire grab, preventing any data from being returned
 }
 
 // ScanTarget is the host that will be scanned
@@ -23,7 +29,7 @@ type ScanTarget struct {
 	IP     net.IP
 	Domain string
 	Tag    string
-	Port   *uint
+	Port   uint
 }
 
 func (target ScanTarget) String() string {
@@ -56,78 +62,147 @@ func (target *ScanTarget) Host() string {
 	panic("unreachable")
 }
 
-// Open connects to the ScanTarget using the configured flags, and returns a net.Conn that uses the configured timeouts for Read/Write operations.
-func (target *ScanTarget) Open(flags *BaseFlags) (net.Conn, error) {
-	var port uint
-	// If the port is supplied in ScanTarget, let that override the cmdline option
-	if target.Port != nil {
-		port = *target.Port
-	} else {
-		port = flags.Port
-	}
+// GetDefaultTCPDialer returns a TCP dialer suitable for modules with default TCP behavior
+func GetDefaultTCPDialer(flags *BaseFlags) func(ctx context.Context, t *ScanTarget, addr string) (net.Conn, error) {
+	// create dialer once and reuse it
+	return func(ctx context.Context, t *ScanTarget, addr string) (net.Conn, error) {
+		dialer := GetTimeoutConnectionDialer(flags.ConnectTimeout, flags.TargetTimeout)
+		// If the scan is for a specific IP, and a domain name is provided, we
+		// don't want to just let the http library resolve the domain.  Create
+		// a fake resolver that we will use, that always returns the IP we are
+		// given to scan.
+		if t.IP != nil && t.Domain != "" {
+			host, _, err := net.SplitHostPort(addr)
+			if err != nil {
+				log.Errorf("http/scanner.go dialContext: unable to split host:port '%s'", addr)
+				log.Errorf("No fake resolver, IP address may be incorrect: %s", err)
+			} else {
+				// In the case of redirects, we don't want to blindly use the
+				// IP we were given to scan, however.  Only use the fake
+				// resolver if the domain originally specified for the scan
+				// target matches the current address being looked up in this
+				// DialContext.
+				if host == t.Domain {
+					resolver, err := NewFakeResolver(t.IP.String())
+					if err != nil {
+						return nil, err
+					}
+					dialer.Resolver = resolver
+				}
+			}
+		}
+		err := dialer.SetRandomLocalAddr("tcp", config.localAddrs, config.localPorts, t.IP)
+		if err != nil {
+			return nil, fmt.Errorf("could not set random local address: %w", err)
+		}
+		handshakeCtx := ctx
+		if flags.ConnectTimeout > 0 {
+			var cancel context.CancelFunc
+			handshakeCtx, cancel = context.WithTimeout(ctx, flags.ConnectTimeout)
+			defer cancel()
+		}
+		conn, err := dialer.DialContext(handshakeCtx, "tcp", addr)
+		if err != nil {
+			return nil, err
+		}
+		if castConn, ok := conn.(*TimeoutConnection); ok {
+			// Re-root the connection's context at the main context rather than the
+			// handshake context, but preserve the per-target SessionTimeout so the
+			// target timeout is still enforced after the dial completes.
+			if castConn.Cancel != nil {
+				castConn.Cancel()
+			}
+			if castConn.SessionTimeout > 0 {
+				castConn.ctx, castConn.Cancel = context.WithTimeout(ctx, castConn.SessionTimeout)
+			} else {
+				castConn.ctx, castConn.Cancel = context.WithCancel(ctx)
+			}
 
-	address := net.JoinHostPort(target.Host(), fmt.Sprintf("%d", port))
-	return DialTimeoutConnection("tcp", address, flags.Timeout, flags.BytesReadLimit)
+			if err = castConn.SaturateTimeoutsToReadAndWriteTimeouts(); err != nil {
+				return nil, err
+			}
+		}
+		return conn, nil
+	}
 }
 
-// OpenTLS connects to the ScanTarget using the configured flags, then performs
-// the TLS handshake. On success error is nil, but the connection can be non-nil
-// even if there is an error (this allows fetching the handshake log).
-func (target *ScanTarget) OpenTLS(baseFlags *BaseFlags, tlsFlags *TLSFlags) (*TLSConnection, error) {
-	conn, err := tlsFlags.Connect(target, baseFlags)
-	if err != nil {
-		return conn, err
+// GetDefaultTLSDialer returns a TLS-over-TCP dialer suitable for modules with default TLS behavior
+func GetDefaultTLSDialer(flags *BaseFlags, tlsFlags *TLSFlags) func(ctx context.Context, t *ScanTarget, addr string) (net.Conn, error) {
+	return func(ctx context.Context, t *ScanTarget, addr string) (net.Conn, error) {
+		l4Conn, err := GetDefaultTCPDialer(flags)(ctx, t, addr)
+		if err != nil {
+			return nil, fmt.Errorf("could not initiate a L4 connection with L4 dialer: %w", err)
+		}
+		return GetDefaultTLSWrapper(flags, tlsFlags)(ctx, t, l4Conn)
 	}
-	err = conn.Handshake()
-	return conn, err
 }
 
-// OpenUDP connects to the ScanTarget using the configured flags, and returns a net.Conn that uses the configured timeouts for Read/Write operations.
-// Note that the UDP "connection" does not have an associated timeout.
-func (target *ScanTarget) OpenUDP(flags *BaseFlags, udp *UDPFlags) (net.Conn, error) {
-	var port uint
-	// If the port is supplied in ScanTarget, let that override the cmdline option
-	if target.Port != nil {
-		port = *target.Port
-	} else {
-		port = flags.Port
-	}
-	address := net.JoinHostPort(target.Host(), fmt.Sprintf("%d", port))
-	var local *net.UDPAddr
-	if udp != nil && (udp.LocalAddress != "" || udp.LocalPort != 0) {
-		local = &net.UDPAddr{}
-		if udp.LocalAddress != "" && udp.LocalAddress != "*" {
-			local.IP = net.ParseIP(udp.LocalAddress)
+// GetDefaultTLSWrapper uses the TLS flags to create a wrapper that upgrades a TCP connection to a TLS connection.
+func GetDefaultTLSWrapper(baseFlags *BaseFlags, tlsFlags *TLSFlags) func(ctx context.Context, t *ScanTarget, conn net.Conn) (*TLSConnection, error) {
+	return func(ctx context.Context, t *ScanTarget, conn net.Conn) (*TLSConnection, error) {
+		tlsConfig, err := tlsFlags.GetTLSConfigForTarget(t)
+		if err != nil {
+			return nil, fmt.Errorf("could not get tls config for target %s: %w", t.String(), err)
 		}
-		if udp.LocalPort != 0 {
-			local.Port = int(udp.LocalPort)
+		// Set SNI server name on redirects unless --server-name was used (issue #300)
+		//  - t.Domain is always set to the *original* Host so it's not useful for setting SNI
+		//  - host is the current target of the request in this context; this is true for the
+		//    initial request as well as subsequent requests caused by redirects
+		//  - scan.scanner.config.ServerName is the value from --server-name if one was specified
+
+		// If SNI is enabled and --server-name is not set, use the target host for the SNI server name
+		if !tlsFlags.NoSNI && tlsFlags.ServerName == "" {
+			host := t.Domain
+			// RFC4366: Literal IPv4 and IPv6 addresses are not permitted in "HostName"
+			if i := net.ParseIP(host); i == nil {
+				tlsConfig.ServerName = host
+			}
 		}
+		tlsConn := TLSConnection{
+			Conn:  *(tls.Client(conn, tlsConfig)),
+			flags: tlsFlags,
+		}
+		handshakeCtx := ctx
+		if tlsFlags.TLSHandshakeTimeout > 0 {
+			var cancel context.CancelFunc
+			handshakeCtx, cancel = context.WithTimeout(ctx, tlsFlags.TLSHandshakeTimeout)
+			defer cancel()
+		}
+		err = tlsConn.HandshakeContext(handshakeCtx)
+		if err != nil && tlsConn.log == nil {
+			// If the handshake fails and we have no log, just return error
+			return nil, fmt.Errorf("could not perform tls handshake for target %s: %w", t.String(), err)
+		} else if err != nil {
+			// We'll return both the error and the connection so ZGrab can return the handshake log
+			return &tlsConn, fmt.Errorf("could not successfully complete tls handshake for target %s: %w", t.String(), err)
+		}
+		return &tlsConn, err
 	}
-	remote, err := net.ResolveUDPAddr("udp", address)
-	if err != nil {
-		return nil, err
+}
+
+// GetDefaultUDPDialer returns a UDP dialer suitable for modules with default UDP behavior
+func GetDefaultUDPDialer(flags *BaseFlags) func(ctx context.Context, t *ScanTarget, addr string) (net.Conn, error) {
+	// create dialer once and reuse it
+	return func(ctx context.Context, t *ScanTarget, addr string) (net.Conn, error) {
+		dialer := GetTimeoutConnectionDialer(flags.ConnectTimeout, flags.TargetTimeout)
+		err := dialer.SetRandomLocalAddr("udp", config.localAddrs, config.localPorts, t.IP)
+		if err != nil {
+			return nil, fmt.Errorf("could not set random local address: %w", err)
+		}
+		return dialer.DialContext(ctx, "udp", addr)
 	}
-	conn, err := net.DialUDP("udp", local, remote)
-	if err != nil {
-		return nil, err
-	}
-	return NewTimeoutConnection(nil, conn, flags.Timeout, 0, 0, flags.BytesReadLimit), nil
 }
 
 // BuildGrabFromInputResponse constructs a Grab object for a target, given the
 // scan responses.
 func BuildGrabFromInputResponse(t *ScanTarget, responses map[string]ScanResponse) *Grab {
 	var ipstr string
-	var port uint
 	if t.IP != nil {
 		ipstr = t.IP.String()
 	}
-	if t.Port != nil {
-		port = *t.Port
-	}
 	return &Grab{
 		IP:     ipstr,
-		Port:   port,
+		Port:   t.Port,
 		Domain: t.Domain,
 		Data:   responses,
 	}
@@ -135,7 +210,7 @@ func BuildGrabFromInputResponse(t *ScanTarget, responses map[string]ScanResponse
 
 // EncodeGrab serializes a Grab to JSON, handling the debug fields if necessary.
 func EncodeGrab(raw *Grab, includeDebug bool) ([]byte, error) {
-	var outputData interface{}
+	var outputData any
 	if includeDebug {
 		outputData = raw
 	} else {
@@ -154,23 +229,62 @@ func EncodeGrab(raw *Grab, includeDebug bool) ([]byte, error) {
 }
 
 // grabTarget calls handler for each action
-func grabTarget(input ScanTarget, m *Monitor) []byte {
+func grabTarget(ctx context.Context, input ScanTarget, m *Monitor) *Grab {
 	moduleResult := make(map[string]ScanResponse)
-
+	if len(input.Domain) > 0 && input.IP == nil {
+		// If there's an issue with resolving the target, then no module will be able to scan it.
+		onResolutionFailure := func(input ScanTarget, mon *Monitor, err error) *Grab {
+			for _, scannerName := range orderedScanners {
+				// send a failure to the monitor for each scanner
+				mon.statusesChan <- moduleStatus{name: scannerName, st: statusFailure}
+			}
+			return &Grab{
+				Port:   input.Port,
+				Domain: input.Domain,
+				Error:  err.Error(),
+			}
+		}
+		// resolve the target's IP here once, so it doesn't need to be resolved in each module
+		dialer := NewDialer(nil)
+		err := dialer.SetRandomLocalAddr("udp", config.localAddrs, config.localPorts, nil)
+		if err != nil {
+			return onResolutionFailure(input, m, fmt.Errorf("could not set random local address: %w", err))
+		}
+		var reachableIPs []net.IP
+		// only use special timeout if it's set, otherwise use the default context timeout
+		lookupCtx, cancel := context.WithTimeout(ctx, config.DNSResolutionTimeout)
+		defer cancel()
+		reachableIPs, err = dialer.lookupIPs(lookupCtx, input.Domain)
+		if err != nil {
+			return onResolutionFailure(input, m, fmt.Errorf("could not resolve domain %s: %w", input.Domain, err))
+		}
+		input.IP = reachableIPs[rand.Intn(len(reachableIPs))]
+	}
 	for _, scannerName := range orderedScanners {
 		scanner := scanners[scannerName]
 		trigger := (*scanner).GetTrigger()
 		if input.Tag != trigger {
 			continue
 		}
-		defer func(name string) {
-			if e := recover(); e != nil {
-				log.Errorf("Panic on scanner %s when scanning target %s: %#v", scannerName, input.String(), e)
-				// Bubble out original error (with original stack) in lieu of explicitly logging the stack / error
-				panic(e)
-			}
-		}(scannerName)
-		name, res := RunScanner(*scanner, m, input)
+		// Run each scanner in a closure with its own panic recovery so a panic in
+		// one scanner is recorded as an error result and the loop still continues
+		// to BuildGrabFromInputResponse, rather than unwinding grabTarget and
+		// discarding all results.
+		name, res := func() (name string, res ScanResponse) {
+			defer func() {
+				if e := recover(); e != nil {
+					log.Errorf("Panic on scanner %s when scanning target %s: %#v\n%s", scannerName, input.String(), e, debug.Stack())
+					errMsg := fmt.Sprintf("panic: %v", e)
+					name = scannerName
+					res = ScanResponse{
+						Status:   SCAN_UNKNOWN_ERROR,
+						Protocol: scannerName,
+						Error:    &errMsg,
+					}
+				}
+			}()
+			return RunScanner(ctx, *scanner, m, input)
+		}()
 		moduleResult[name] = res
 		if res.Error != nil && !config.Multiple.ContinueOnError {
 			break
@@ -180,13 +294,7 @@ func grabTarget(input ScanTarget, m *Monitor) []byte {
 		}
 	}
 
-	raw := BuildGrabFromInputResponse(&input, moduleResult)
-	result, err := EncodeGrab(raw, includeDebugOutput())
-	if err != nil {
-		log.Errorf("unable to marshal data: %s", err)
-	}
-
-	return result
+	return BuildGrabFromInputResponse(&input, moduleResult)
 }
 
 // Process sets up an output encoder, input reader, and starts grab workers.
@@ -213,11 +321,17 @@ func Process(mon *Monitor) {
 		go func(i int) {
 			for _, scannerName := range orderedScanners {
 				scanner := *scanners[scannerName]
-				scanner.InitPerSender(i)
+				if err := scanner.InitPerSender(i); err != nil {
+					log.Fatalf("error initializing sender %d with scanner %s: %v", i, scannerName, err)
+				}
 			}
 			for obj := range processQueue {
 				for run := uint(0); run < uint(config.ConnectionsPerHost); run++ {
-					result := grabTarget(obj, mon)
+					grab := grabTarget(context.Background(), obj, mon)
+					result, err := EncodeGrab(grab, includeDebugOutput())
+					if err != nil {
+						log.Errorf("unable to marshal data: %s", err)
+					}
 					outputQueue <- result
 				}
 			}

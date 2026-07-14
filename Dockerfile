@@ -1,6 +1,6 @@
 ## Build image ##
-ARG GO_VERSION=1.20
-FROM golang:${GO_VERSION}-alpine3.16 as build
+ARG GO_VERSION=1.25
+FROM golang:${GO_VERSION}-alpine3.21 AS build
 
 # System dependencies
 RUN apk add --no-cache make
@@ -13,11 +13,14 @@ RUN go mod download && go mod verify
 
 # Build the actual app
 COPY . .
-RUN make all
+RUN CGO_ENABLED=0 GOOS=linux make all
 
 ## Runtime image ##
-FROM alpine:3.20 as run
+FROM alpine:latest
 
 COPY --from=build /usr/src/zgrab2/cmd/zgrab2/zgrab2 /usr/bin/zgrab2
+RUN mkdir -p /root/.config/zgrab2
+COPY --from=build /usr/src/zgrab2/conf/blocklist.conf /root/.config/zgrab2/blocklist.conf
 
-ENTRYPOINT ["/usr/bin/zgrab2"]
+WORKDIR /usr/bin/
+ENTRYPOINT ["zgrab2"]

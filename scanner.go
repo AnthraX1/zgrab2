@@ -1,22 +1,50 @@
 package zgrab2
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"net/netip"
 	"time"
+
+	"golang.org/x/time/rate"
+
+	"github.com/zmap/zgrab2/ratelimit"
 )
 
-var scanners map[string]*Scanner
+var scanners = make(map[string]*Scanner)
 var orderedScanners []string
+var defaultDialerGroupToScanners = make(map[string]*DialerGroup)
+var defaultDialerGroupConfigToScanners = make(map[string]*DialerGroupConfig)
+var ipRateLimiter = ratelimit.NewPerObjectRateLimiter[netip.Addr](maxLRUSize, maxLRUTTL)
+var dnsRateLimiter = rate.NewLimiter(rate.Limit(defaultDNSServerRateLimit), defaultDNSServerRateLimit)
+
+const (
+	maxLRUSize = 10_000_000       // Limiters track IP connects per second. There's no way we'll have over 10 million unique IPs per second, so this should be plenty.
+	maxLRUTTL  = time.Second * 10 // Memory Leak Avoidance - We'll remove a limiter for an IP after 10 seconds of inactivity. It'll be re-created if the IP connects again after that time.
+)
 
 // RegisterScan registers each individual scanner to be ran by the framework
-func RegisterScan(name string, s Scanner) {
+func RegisterScan(name string, scanner Scanner) {
 	//add to list and map
-	if scanners[name] != nil {
+	if scanners[name] != nil || defaultDialerGroupToScanners[name] != nil {
 		log.Fatalf("name: %s already used", name)
 	}
 	orderedScanners = append(orderedScanners, name)
-	scanners[name] = &s
+	dialerConfig := scanner.GetDialerGroupConfig()
+	if dialerConfig == nil {
+		log.Fatalf("no dialer config for %s", name)
+	}
+	if err := dialerConfig.Validate(); err != nil {
+		log.Fatalf("error validating dialer config for %s: %v", name, err)
+	}
+	defaultDialerGroupConfigToScanners[name] = dialerConfig
+	dialerGroup, err := dialerConfig.GetDefaultDialerGroupFromConfig()
+	if err != nil {
+		log.Fatalf("error getting default dialer group for %s: %v", name, err)
+	}
+	defaultDialerGroupToScanners[name] = dialerGroup
+	scanners[name] = &scanner
 }
 
 // PrintScanners prints all registered scanners
@@ -27,22 +55,39 @@ func PrintScanners() {
 }
 
 // RunScanner runs a single scan on a target and returns the resulting data
-func RunScanner(s Scanner, mon *Monitor, target ScanTarget) (string, ScanResponse) {
-	t := time.Now()
-	status, res, e := s.Scan(target)
+func RunScanner(ctx context.Context, scanner Scanner, mon *Monitor, target ScanTarget) (string, ScanResponse) {
+	dialerGroupConfig, ok := defaultDialerGroupConfigToScanners[scanner.GetName()]
+	if !ok {
+		log.Fatalf("no default dialer group config for %s", scanner.GetName())
+	}
+	dialerGroup, ok := defaultDialerGroupToScanners[scanner.GetName()]
+	if !ok {
+		log.Fatalf("no default dialer group for %s", scanner.GetName())
+	}
+	// if target's port isn't set, use default. Won't affect the caller's ScanTarget since it's passed by value
+	if target.Port == 0 {
+		target.Port = dialerGroupConfig.BaseFlags.Port
+	}
+	if dialerGroupConfig.BaseFlags.TargetTimeout > 0 {
+		// timeout is set, use it on the context
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(context.Background(), time.Now().Add(dialerGroupConfig.BaseFlags.TargetTimeout))
+		defer cancel()
+	}
+	status, res, e := scanner.Scan(ctx, dialerGroup, &target)
 	var err *string
 	if e == nil {
-		mon.statusesChan <- moduleStatus{name: s.GetName(), st: statusSuccess}
+		mon.statusesChan <- moduleStatus{name: scanner.GetName(), st: statusSuccess}
 		err = nil
 	} else {
-		mon.statusesChan <- moduleStatus{name: s.GetName(), st: statusFailure}
+		if deadline, ok := ctx.Deadline(); ok && deadline.Before(time.Now()) {
+			// scan timed out
+			e = fmt.Errorf("ctx deadline exceeded: %w", e)
+		}
+		mon.statusesChan <- moduleStatus{name: scanner.GetName(), st: statusFailure}
 		errString := e.Error()
 		err = &errString
 	}
-	resp := ScanResponse{Result: res, Protocol: s.Protocol(), Error: err, Timestamp: t.Format(time.RFC3339), Status: status}
-	return s.GetName(), resp
-}
-
-func init() {
-	scanners = make(map[string]*Scanner)
+	resp := ScanResponse{Result: res, Port: target.Port, Protocol: scanner.Protocol(), Error: err, Timestamp: time.Now().Format(time.RFC3339), Status: status}
+	return scanner.GetName(), resp
 }

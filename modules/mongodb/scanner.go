@@ -1,17 +1,20 @@
 package mongodb
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 
 	log "github.com/sirupsen/logrus"
-	"github.com/zmap/zgrab2"
 	"gopkg.in/mgo.v2/bson"
+
+	"github.com/zmap/zgrab2"
 )
 
-// Module implements the zgrab2.Module interface
-type Module struct {
+func NewModule() *zgrab2.TypedModule[Flags, Scanner, *Scanner] {
+	return zgrab2.NewTypedModule[Flags, Scanner, *Scanner]("mongodb", "Document-oriented Database (MongoDB)", "Perform a handshake with a MongoDB server", 27017)
 }
 
 // Flags contains mongodb-specific command-line flags.
@@ -22,6 +25,7 @@ type Flags struct {
 
 // Scanner implements the zgrab2.Scanner interface
 type Scanner struct {
+	zgrab2.BaseScanner
 	config              *Flags
 	isMasterMsg         []byte
 	buildInfoCommandMsg []byte
@@ -193,63 +197,23 @@ type Result struct {
 func (scanner *Scanner) Init(flags zgrab2.ScanFlags) error {
 	f, _ := flags.(*Flags)
 	scanner.config = f
+	scanner.SetBaseFlags(&f.BaseFlags)
 	scanner.isMasterMsg = getIsMasterMsg()
 	scanner.buildInfoCommandMsg = getBuildInfoQuery()
 	scanner.buildInfoOpMsg = getBuildInfoOpMsg()
 	scanner.listDatabasesMsg = getListDatabasesMsg()
+	scanner.DialerGroupConfig = &zgrab2.DialerGroupConfig{
+		TransportAgnosticDialerProtocol: zgrab2.TransportTCP,
+		BaseFlags:                       &f.BaseFlags,
+	}
 	return nil
-}
-
-// InitPerSender initializes the scanner for a given sender
-func (scanner *Scanner) InitPerSender(senderID int) error {
-	return nil
-}
-
-// GetName returns the name of the scanner
-func (scanner *Scanner) GetName() string {
-	return scanner.config.Name
-}
-
-// Protocol returns the protocol identifer for the scanner.
-func (s *Scanner) Protocol() string {
-	return "mongodb"
-}
-
-// GetTrigger returns the Trigger defined in the Flags.
-func (scanner *Scanner) GetTrigger() string {
-	return scanner.config.Trigger
-}
-
-// Validate checks that the flags are valid
-func (flags *Flags) Validate(args []string) error {
-	return nil
-}
-
-// Help returns the module's help string
-func (flags *Flags) Help() string {
-	return ""
-}
-
-// NewFlags provides an empty instance of the flags that will be filled in by the framework
-func (module *Module) NewFlags() interface{} {
-	return new(Flags)
-}
-
-// NewScanner provides a new scanner instance
-func (module *Module) NewScanner() zgrab2.Scanner {
-	return new(Scanner)
-}
-
-// Description returns an overview of this module.
-func (module *Module) Description() string {
-	return "Perform a handshake with a MongoDB server"
 }
 
 // StartScan opens a connection to the target and sets up a scan instance for it.
-func (scanner *Scanner) StartScan(target *zgrab2.ScanTarget) (*scan, error) {
-	conn, err := target.Open(&scanner.config.BaseFlags)
+func (scanner *Scanner) StartScan(ctx context.Context, target *zgrab2.ScanTarget, dialGroup *zgrab2.DialerGroup) (*scan, error) {
+	conn, err := dialGroup.Dial(ctx, target)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to dial %s: %w", target.String(), err)
 	}
 
 	return &scan{
@@ -260,7 +224,7 @@ func (scanner *Scanner) StartScan(target *zgrab2.ScanTarget) (*scan, error) {
 			scanner: scanner,
 			conn:    conn,
 		},
-		close: func() { conn.Close() },
+		close: func() { zgrab2.CloseConnAndHandleError(conn) },
 	}, nil
 }
 
@@ -268,31 +232,33 @@ func (scanner *Scanner) StartScan(target *zgrab2.ScanTarget) (*scan, error) {
 func getIsMaster(conn *Connection) (*IsMaster_t, error) {
 	document := &IsMaster_t{}
 	doc_offset := MSGHEADER_LEN + 20
-	conn.Write(conn.scanner.isMasterMsg)
+	err := conn.Write(conn.scanner.isMasterMsg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to write isMaster message: %w", err)
+	}
 
 	msg, err := conn.ReadMsg()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read isMaster response: %w", err)
 	}
 
 	if len(msg) < doc_offset+4 {
-		err = fmt.Errorf("Server truncated message - no query reply (%d bytes: %s)", len(msg), hex.EncodeToString(msg))
+		err = fmt.Errorf("server truncated message - no query reply (%d bytes: %s)", len(msg), hex.EncodeToString(msg))
 		return nil, err
 	}
 	respFlags := binary.LittleEndian.Uint32(msg[MSGHEADER_LEN : MSGHEADER_LEN+4])
 	if respFlags&QUERY_RESP_FAILED != 0 {
-		err = fmt.Errorf("isMaster query failed")
-		return nil, err
+		return nil, errors.New("isMaster query failed")
 	}
 	doclen := int(binary.LittleEndian.Uint32(msg[doc_offset : doc_offset+4]))
 	if len(msg[doc_offset:]) < doclen {
-		err = fmt.Errorf("Server truncated BSON reply doc (%d bytes: %s)",
+		err = fmt.Errorf("server truncated BSON reply doc (%d bytes: %s)",
 			len(msg[doc_offset:]), hex.EncodeToString(msg))
 		return nil, err
 	}
 	err = bson.Unmarshal(msg[doc_offset:], &document)
 	if err != nil {
-		err = fmt.Errorf("Server sent invalid BSON reply doc (%d bytes: %s)",
+		err = fmt.Errorf("server sent invalid BSON reply doc (%d bytes: %s)",
 			len(msg[doc_offset:]), hex.EncodeToString(msg))
 		return nil, err
 	}
@@ -301,19 +267,25 @@ func getIsMaster(conn *Connection) (*IsMaster_t, error) {
 
 func listDatabases(conn *Connection) (*ListDatabases_t, error) {
 	document := ListDatabases_t{}
-	conn.Write(conn.scanner.listDatabasesMsg)
+	if err := conn.Write(conn.scanner.listDatabasesMsg); err != nil {
+		return nil, fmt.Errorf("failed to write listDatabases message: %w", err)
+	}
 
 	msg, err := conn.ReadMsg()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read listDatabases response: %w", err)
 	}
 
-	bson.Unmarshal(msg[MSGHEADER_LEN+20:], &document)
+	if err = bson.Unmarshal(msg[MSGHEADER_LEN+20:], &document); err != nil {
+		return nil, fmt.Errorf("failed to unmarshall listDatabases message: %w", err)
+	}
 	return &document, nil
 }
 
 // Scan connects to a host and performs a scan.
 // https://github.com/mongodb/specifications/blob/master/source/message/OP_MSG.rst
+func (scanner *Scanner) Scan(ctx context.Context, dialGroup *zgrab2.DialerGroup, target *zgrab2.ScanTarget) (zgrab2.ScanStatus, any, error) {
+	scan, err := scanner.StartScan(ctx, target, dialGroup)
 func (scanner *Scanner) Scan(target zgrab2.ScanTarget) (zgrab2.ScanStatus, interface{}, error) {
 	try := 0
 	var (
@@ -346,12 +318,12 @@ func (scanner *Scanner) Scan(target zgrab2.ScanTarget) (zgrab2.ScanStatus, inter
 		break
 	}
 	if err != nil {
-		return zgrab2.SCAN_PROTOCOL_ERROR, nil, err
+		return zgrab2.SCAN_PROTOCOL_ERROR, nil, fmt.Errorf("isMaster query failed to target %s: %w", target.String(), err)
 	}
 
 	result.DatabaseInfo, err = listDatabases(scan.conn)
 	if err != nil {
-		return zgrab2.SCAN_PROTOCOL_ERROR, nil, err
+		return zgrab2.SCAN_PROTOCOL_ERROR, nil, fmt.Errorf("listDatabases query failed to target %s: %w", target.String(), err)
 	}
 
 	var query []byte
@@ -370,27 +342,23 @@ func (scanner *Scanner) Scan(target zgrab2.ScanTarget) (zgrab2.ScanStatus, inter
 		resp_offset = 5
 	}
 
-	scan.conn.Write(query)
+	err = scan.conn.Write(query)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to write buildInfo message to target %s: %w", target.String(), err)
+	}
 	msg, err := scan.conn.ReadMsg()
 	if err != nil {
-		return zgrab2.TryGetScanStatus(err), &result, err
+		return zgrab2.TryGetScanStatus(err), &result, fmt.Errorf("failed to read buildInfo message from target %s: %w", target.String(), err)
 	}
 
 	if len(msg) < MSGHEADER_LEN+resplen_offset {
-		err = fmt.Errorf("Server truncated message - no metadata doc (%d bytes: %s)", len(msg), hex.EncodeToString(msg))
+		err = fmt.Errorf("server truncated message - no metadata doc (%d bytes: %s)", len(msg), hex.EncodeToString(msg))
 		return zgrab2.SCAN_PROTOCOL_ERROR, &result, err
 	}
 
-	bson.Unmarshal(msg[MSGHEADER_LEN+resp_offset:], &result.BuildInfo)
-
-	return zgrab2.SCAN_SUCCESS, &result, err
-}
-
-// RegisterModule registers the zgrab2 module.
-func RegisterModule() {
-	var module Module
-	_, err := zgrab2.AddCommand("mongodb", "mongodb", module.Description(), 27017, &module)
+	err = bson.Unmarshal(msg[MSGHEADER_LEN+resp_offset:], &result.BuildInfo)
 	if err != nil {
-		log.Fatal(err)
+		return zgrab2.SCAN_PROTOCOL_ERROR, nil, fmt.Errorf("failed to unmarshall buildInfo message from target %s: %w", target.String(), err)
 	}
+	return zgrab2.SCAN_SUCCESS, &result, nil
 }

@@ -24,7 +24,7 @@ func interleave(expected, actual []byte) string {
 	a := strings.Split(string(hex.Dump(actual)), "\n")
 	n := max(len(e), len(a))
 	for i := 0; i < n-1; i++ {
-		var ei, ai string = "", ""
+		var ei, ai = "", ""
 		if i < len(e) {
 			ei = e[i]
 		}
@@ -442,7 +442,7 @@ var validTNSAccept = map[string]TestCase{
 	},
 }
 
-func serialize(val interface{}) []byte {
+func serialize(val any) []byte {
 	// According to the comments in json.Marshal, JSON object keys are sorted,
 	// so this is suitable for comparison.
 	ret, err := json.Marshal(val)
@@ -450,13 +450,6 @@ func serialize(val interface{}) []byte {
 		panic(err)
 	}
 	return ret
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 func getTNSDriver() *TNSDriver {
@@ -703,14 +696,6 @@ func TestDescriptorGetValue(t *testing.T) {
 			}
 		}
 	}
-}
-
-func removeSpace(s string) string {
-	ret := strings.Replace(s, "\r", "", -1)
-	ret = strings.Replace(ret, "\n", "", -1)
-	ret = strings.Replace(ret, "\t", "", -1)
-	ret = strings.Replace(ret, " ", "", -1)
-	return ret
 }
 
 func stringSlicesEqual(lhs, rhs []string) bool {

@@ -1,6 +1,7 @@
 package mssql
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+
 	"github.com/zmap/zgrab2"
 )
 
@@ -394,7 +396,7 @@ func (options PreloginOptions) Encode() ([]byte, error) {
 	// starting just after the TERMINATOR token
 	offset := options.HeaderSize()
 	// Ensure that the tokens are encoded in ascending order
-	var sortedKeys []int
+	sortedKeys := make([]int, 0, len(options))
 	for k := range options {
 		sortedKeys = append(sortedKeys, int(k))
 	}
@@ -549,30 +551,13 @@ type TDSPacket struct {
 	Body []byte
 }
 
-// decodeTDSPacket decodes a TDSPacket from the start of buf, returning the
-// packet and any remaining bytes following it.
-func decodeTDSPacket(buf []byte) (*TDSPacket, []byte, error) {
-	header, err := decodeTDSHeader(buf)
-	if err != nil {
-		return nil, nil, err
-	}
-	if len(buf) < int(header.Length) {
-		return nil, nil, ErrBufferTooSmall
-	}
-	body := buf[8:header.Length]
-	return &TDSPacket{
-		TDSHeader: *header,
-		Body:      body,
-	}, buf[header.Length:], nil
-}
-
 // Encode returns the encoded packet: header + body. Updates the header's length
 // to match the actual body length.
 func (packet *TDSPacket) Encode() ([]byte, error) {
 	if len(packet.Body)+8 > 0xffff {
 		return nil, ErrTooLarge
 	}
-	packet.TDSHeader.Length = uint16(len(packet.Body) + 8)
+	packet.Length = uint16(len(packet.Body) + 8)
 	header := packet.TDSHeader.Encode()
 	ret := append(header, packet.Body...)
 	return ret, nil
@@ -664,9 +649,6 @@ func (connection *Connection) readPreloginPacket() (*TDSPacket, *PreloginOptions
 // specifically returns the ENCRYPTION value (which is used to determine whether
 // a TLS handshake needs to be done).
 func (connection *Connection) prelogin(clientEncrypt EncryptMode) (EncryptMode, error) {
-	if clientEncrypt < 0 || clientEncrypt > 0xff {
-		return EncryptModeUnknown, ErrInvalidData
-	}
 	clientOptions := PreloginOptions{
 		PreloginVersion:    {0, 0, 0, 0, 0, 0},
 		PreloginEncryption: {byte(clientEncrypt)},
@@ -745,14 +727,6 @@ type tdsConnection struct {
 	remainder []byte
 }
 
-// return the lesser of a, b
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 // Check if the given header is likely to be a valid TDS header (for detection
 // purposes).
 func isValidTDSHeader(header *TDSHeader) bool {
@@ -776,10 +750,7 @@ func isValidTDSHeader(header *TDSHeader) bool {
 		return false
 	}
 	_, ok := knownTDSPacketTypes[TDSPacketType(header.Type)]
-	if !ok {
-		return false
-	}
-	return true
+	return ok
 }
 
 // Read a single packet from the connection and return the whole packet (this is
@@ -807,45 +778,31 @@ func (connection *tdsConnection) ReadPacket() (*TDSPacket, error) {
 }
 
 // The wrapped Read() call. If not enabled, just passes through to conn.Read(b).
-// If it has sufficient data in remainder to satisfy the read, just return that.
-// Otherwise, attempt to read a header (FIXME: with a 1s timeout), then block
-// oreading the entire packet and add it to the remainder.
-// Then, consume and repeat. If there is an error reading, return the error back
-// to the user with the corresponding bytes read.
+// If it has any data in remainder to satisfy the read, just return that.
+// Otherwise, attempt to read a new TDS packet, add it to the remainder, and return
+// as much data as requested (or available). This method DOES NOT guarantee to fill
+// the input buffer.
 func (connection *tdsConnection) Read(b []byte) (n int, err error) {
 	if !connection.enabled {
 		return connection.conn.Read(b)
 	}
-	output := b
-	soFar := 0
-	for len(output) > len(connection.remainder) {
-		copy(output, connection.remainder)
-		output = output[len(connection.remainder):]
-		soFar = soFar + len(connection.remainder)
-		connection.remainder = make([]byte, 0)
-		// BEGIN FIXME
-		connection.conn.SetReadDeadline(time.Now().Add(1e9))
-		header, err := readTDSHeader(connection.conn)
+
+	// If we don't have any data in remainder, we need to read at least one packet
+	if len(connection.remainder) == 0 {
+		packet, err := connection.ReadPacket()
 		if err != nil {
-			return soFar, err
+			return 0, err
 		}
-		// END FIXME
-		connection.remainder = make([]byte, header.Length-8)
-		_, err = io.ReadFull(connection.conn, connection.remainder)
-		if err != nil {
-			logrus.Debugf("Error reading body: %v", err)
-			return soFar, err
-		}
-		toCopy := min(len(output), len(connection.remainder))
-		copy(output, connection.remainder[0:toCopy])
-		output = output[toCopy:]
-		connection.remainder = connection.remainder[toCopy:]
-		soFar = soFar + toCopy
+
+		connection.remainder = packet.Body
 	}
-	// now len(output) <= len(remainder)
-	copy(output, connection.remainder)
-	connection.remainder = connection.remainder[len(output):]
-	return len(b), nil
+
+	// Now we have data in remainder, copy as much as requested/available
+	toCopy := min(len(b), len(connection.remainder))
+	copy(b, connection.remainder[:toCopy])
+	connection.remainder = connection.remainder[toCopy:]
+
+	return toCopy, nil
 }
 
 // The wrapped Write method. If not enabled, just pass through to conn.Write.
@@ -923,12 +880,12 @@ func NewConnection(conn net.Conn) *Connection {
 func (connection *Connection) Login() {
 	panic("unimplemented")
 	// TODO: send login
-	if connection.getEncryptMode() != EncryptModeOn {
-		// Client was only using encryption for login, so switch back to rawConn
-		connection.tdsConn = &tdsConnection{conn: connection.rawConn, enabled: true, session: connection}
-		// tdsConnection.Write(rawData) -> net.Conn.Write(header + rawData)
-		// conn.Read() -> header + rawData -> tdsConnection.Read() -> rawData
-	}
+	//if connection.getEncryptMode() != EncryptModeOn {
+	//	// Client was only using encryption for login, so switch back to rawConn
+	//	connection.tdsConn = &tdsConnection{conn: connection.rawConn, enabled: true, session: connection}
+	//	// tdsConnection.Write(rawData) -> net.Conn.Write(header + rawData)
+	//	// conn.Read() -> header + rawData -> tdsConnection.Read() -> rawData
+	//}
 }
 
 // getEncryptMode returns the EncryptMode enum returned by the server in the
@@ -950,8 +907,8 @@ func (connection *Connection) getEncryptMode() EncryptMode {
 // First sends the PRELOGIN packet to the server and reads the response.
 // Then, if necessary, does a TLS handshake.
 // Returns the ENCRYPTION value from the response to PRELOGIN.
-func (connection *Connection) Handshake(flags *Flags) (EncryptMode, error) {
-	encryptMode := getEncryptMode(flags.EncryptMode)
+func (connection *Connection) Handshake(ctx context.Context, target *zgrab2.ScanTarget, encryptModeStr string, tlsWrapper func(ctx context.Context, target *zgrab2.ScanTarget, l4Conn net.Conn) (*zgrab2.TLSConnection, error)) (EncryptMode, error) {
+	encryptMode := getEncryptMode(encryptModeStr)
 	mode, err := connection.prelogin(encryptMode)
 	if err != nil {
 		return mode, err
@@ -960,9 +917,8 @@ func (connection *Connection) Handshake(flags *Flags) (EncryptMode, error) {
 	if mode == EncryptModeNotSupported {
 		return mode, nil
 	}
-	tlsClient, err := flags.TLSFlags.GetTLSConnection(connection.tdsConn)
-	if err != nil {
-		return mode, err
+	if tlsWrapper == nil {
+		return mode, fmt.Errorf("encrypt_mode=%s but no TLS wrapper provided", mode)
 	}
 	// do handshake: the raw TLS frames are wrapped in a TDS packet:
 	// tls.Conn.Handshake() ->
@@ -972,9 +928,13 @@ func (connection *Connection) Handshake(flags *Flags) (EncryptMode, error) {
 	// net.Conn.Read() => header + serverHello ->
 	// -> tdsConnection.Read() => serverHello ->
 	// -> tls.Conn.Handshake()
-	err = tlsClient.Handshake()
+	tlsClient, err := tlsWrapper(ctx, target, connection.rawConn)
 	if err != nil {
-		return mode, err
+		// no tls client available, but we can still get version
+		connection.tlsConn = nil
+	} else {
+		// we have a TLS client, so we can use it to get the server version
+		connection.tlsConn = tlsClient
 	}
 	// After the SSL handshake has been established, wrap packets before they
 	// are passed into TLS, not after.
@@ -988,6 +948,5 @@ func (connection *Connection) Handshake(flags *Flags) (EncryptMode, error) {
 	// -> TDSWrappedClient.Read() => rawData
 	connection.tdsConn.enabled = false
 	connection.tdsConn = &tdsConnection{conn: tlsClient, enabled: true, session: connection}
-	connection.tlsConn = tlsClient
 	return mode, nil
 }

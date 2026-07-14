@@ -1,22 +1,31 @@
 package zgrab2
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/csv"
 	"fmt"
-	"io/ioutil"
-	"net"
+	"io"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	log "github.com/sirupsen/logrus"
 	"github.com/zmap/zcrypto/encoding/asn1"
+	"github.com/zmap/zcrypto/x509/pkix"
+
+	log "github.com/sirupsen/logrus"
 	"github.com/zmap/zcrypto/tls"
 	"github.com/zmap/zcrypto/x509"
-	"github.com/zmap/zcrypto/x509/pkix"
+
+	"github.com/zmap/zgrab2/lib/fingerprint"
 )
+
+func init() {
+	asn1.AllowPermissiveParsing = true
+	pkix.LegacyNameString = true
+}
 
 // Shared code for TLS scans.
 // Example usage:
@@ -30,9 +39,9 @@ import (
 // Common flags for TLS configuration -- include this in your module's ScanFlags implementation to use the common TLS code
 // Adapted from modules/ssh.go
 type TLSFlags struct {
-	Config *tls.Config // Config is ready to use TLS configuration
+	TLSHandshakeTimeout time.Duration `long:"tls-handshake-timeout" default:"20s" description:"Maximum time to wait for TLS handshake to complete" json:"handshake_timeout"`
 
-	Heartbleed bool `long:"heartbleed" description:"Check if server is vulnerable to Heartbleed"`
+	Config *tls.Config // Config is ready to use TLS configuration
 
 	SessionTicket        bool `long:"session-ticket" description:"Send support for TLS Session Tickets and output ticket if presented" json:"session"`
 	ExtendedMasterSecret bool `long:"extended-master-secret" description:"Offer RFC 7627 Extended Master Secret extension" json:"extended"`
@@ -56,19 +65,70 @@ type TLSFlags struct {
 	VerifyServerCertificate bool   `long:"verify-server-certificate" description:"If set, the scan will fail if the server certificate does not match the server-name, or does not chain to a trusted root."`
 	// TODO: format? mapping? zgrab1 had flags like ChromeOnly, FirefoxOnly, etc...
 	CipherSuite      string `long:"cipher-suite" description:"A comma-delimited list of hex cipher suites to advertise."`
-	MinVersion       int    `long:"min-version" description:"The minimum SSL/TLS version that is acceptable. 0 means that SSLv3 is the minimum."`
+	MinVersion       int    `long:"min-version" description:"The minimum SSL/TLS version that is acceptable. 0 means that TLS1.0 is the minimum."`
 	MaxVersion       int    `long:"max-version" description:"The maximum SSL/TLS version that is acceptable. 0 means use the highest supported value."`
 	CurvePreferences string `long:"curve-preferences" description:"A list of elliptic curves used in an ECDHE handshake, in order of preference."`
+	EnableMLKEM      bool   `long:"enable-mlkem" description:"Advertise TLS 1.3 hybrid PQ group X25519MLKEM768 (ML-KEM + X25519) as first preference"`
 	NoECDHE          bool   `long:"no-ecdhe" description:"Do not allow ECDHE handshakes"`
 	// TODO: format?
 	SignatureAlgorithms string `long:"signature-algorithms" description:"Signature and hash algorithms that are acceptable"`
-	HeartbeatEnabled    bool   `long:"heartbeat-enabled" description:"If set, include the heartbeat extension"`
 	DSAEnabled          bool   `long:"dsa-enabled" description:"Accept server DSA keys"`
 	// TODO: format?
 	ClientRandom string `long:"client-random" description:"Set an explicit Client Random (base64 encoded)"`
 	// TODO: format?
 	ClientHello string `long:"client-hello" description:"Set an explicit ClientHello (base64 encoded)"`
+	OverrideSH  bool   `long:"override-sig-hash" description:"Override the default SignatureAndHashes TLS option with more expansive default"`
+	// EnableJA4SSignatures enables computation of JA4S TLS server fingerprints.
+	// JA4S is subject to commercial licensing restrictions; see https://github.com/FoxIO-LLC/ja4.
+	// JA3S (always enabled) is BSD-3 licensed and free for all use.
+	EnableJA4SSignatures bool `long:"enable-ja4s-signatures" description:"Compute JA4S TLS server fingerprints (subject to commercial licensing; see https://github.com/FoxIO-LLC/ja4)"`
 }
+
+// rootCAsStore is a struct to hold the value of the last x509.CertPool fetched using the RootCAs flag in TLSFlags
+// In CLI usage, this value is constant across all targets, and so doesn't make sense to lookup every time
+type rootCAsCache struct {
+	sync.RWMutex
+	rootCAs         string         // the flag value of what folder to find root cas
+	rootCAsCertPool *x509.CertPool // the Root CAs cert pool itself
+}
+
+// Fetch returns the x509.CertPool from the cache if the rootCAs string matches or from the filesystem if not
+func (s *rootCAsCache) Fetch(rootCAs string) *x509.CertPool {
+	var fd *os.File
+	var err error
+	var pool *x509.CertPool
+	s.RLock() // optimistic reader lock, most cases will just require a read lock since in CLI usage, the rootCAs value is constant
+	if s.rootCAs == rootCAs {
+		certPool := s.rootCAsCertPool
+		s.RUnlock()
+		return certPool
+	}
+	s.RUnlock()
+	s.Lock() // lock for writing, it's possible that another thread has changed the rootCAs value in between the RUnlock and Lock
+	defer s.Unlock()
+	if s.rootCAs == rootCAs { // ensure no one else has changed it
+		certPool := s.rootCAsCertPool
+		return certPool
+	}
+	if fd, err = os.Open(rootCAs); err != nil {
+		log.Fatal(err)
+	}
+	caBytes, readErr := io.ReadAll(fd)
+	if readErr != nil {
+		log.Fatal(err)
+	}
+	pool = x509.NewCertPool()
+	ok := pool.AppendCertsFromPEM(caBytes)
+	if !ok {
+		log.Fatalf("Could not read certificates from PEM file. Invalid PEM?")
+	}
+
+	s.rootCAs = rootCAs
+	s.rootCAsCertPool = pool
+	return s.rootCAsCertPool
+}
+
+var casCache rootCAsCache
 
 func getCSV(arg string) []string {
 	// TODO: Find standard way to pass array-valued options
@@ -119,11 +179,11 @@ func (t *TLSFlags) GetTLSConfigForTarget(target *ScanTarget) (*tls.Config, error
 		var baseTime time.Time
 		baseTime, err = time.Parse("20060102150405Z", t.Time)
 		if err != nil {
-			return nil, fmt.Errorf("Error parsing time '%s': %s", t.Time, err)
+			return nil, fmt.Errorf("error parsing time '%s': %w", t.Time, err)
 		}
 		startTime := time.Now()
 		ret.Time = func() time.Time {
-			offset := time.Now().Sub(startTime)
+			offset := time.Since(startTime)
 			// Return (now - startTime) + baseTime
 			return baseTime.Add(offset)
 		}
@@ -137,23 +197,8 @@ func (t *TLSFlags) GetTLSConfigForTarget(target *ScanTarget) (*tls.Config, error
 		log.Fatalf("--certificate-map not implemented")
 	}
 	if t.RootCAs != "" {
-		var fd *os.File
-		if fd, err = os.Open(t.RootCAs); err != nil {
-			log.Fatal(err)
-		}
-		caBytes, readErr := ioutil.ReadAll(fd)
-		if readErr != nil {
-			log.Fatal(err)
-		}
-		ret.RootCAs = x509.NewCertPool()
-		ok := ret.RootCAs.AppendCertsFromPEM(caBytes)
-		if !ok {
-			log.Fatalf("Could not read certificates from PEM file. Invalid PEM?")
-		}
+		ret.RootCAs = casCache.Fetch(t.RootCAs)
 	}
-
-	asn1.AllowPermissiveParsing = true
-	pkix.LegacyNameString = true
 
 	if t.NextProtos != "" {
 		// TODO: Different format?
@@ -177,6 +222,8 @@ func (t *TLSFlags) GetTLSConfigForTarget(target *ScanTarget) (*tls.Config, error
 	}
 
 	if t.CipherSuite != "" {
+		// User wants us to use their ciphers, tell ZCrypto it must use only these
+		ret.ForceSuites = true
 		// allow either one of our standard values (e.g., chrome) or a comma-delimited list of ciphers
 		if _, ok := cipherMap[t.CipherSuite]; ok {
 			ret.CipherSuites = cipherMap[t.CipherSuite]
@@ -185,7 +232,8 @@ func (t *TLSFlags) GetTLSConfigForTarget(target *ScanTarget) (*tls.Config, error
 			var intCiphers = make([]uint16, len(strCiphers))
 			for i, s := range strCiphers {
 				s = strings.TrimPrefix(s, "0x")
-				v64, err := strconv.ParseUint(s, 16, 16)
+				var v64 uint64
+				v64, err = strconv.ParseUint(s, 16, 16)
 				if err != nil {
 					log.Fatalf("cipher suites: unable to convert %s to a 16bit integer: %s", s, err)
 				}
@@ -203,6 +251,16 @@ func (t *TLSFlags) GetTLSConfigForTarget(target *ScanTarget) (*tls.Config, error
 		ret.MaxVersion = uint16(t.MaxVersion)
 	}
 
+	if t.EnableMLKEM {
+		ret.CurvePreferences = []tls.CurveID{
+			tls.X25519MLKEM768,
+			tls.X25519,
+			tls.CurveP256,
+			tls.CurveP384,
+			tls.CurveP521,
+		}
+	}
+
 	if t.CurvePreferences != "" {
 		// TODO FIXME: Implement (how to map curveName to CurveID? Or are there standard 'suites' like we use for cipher suites?)
 		log.Fatalf("--curve-preferences not implemented")
@@ -216,12 +274,6 @@ func (t *TLSFlags) GetTLSConfigForTarget(target *ScanTarget) (*tls.Config, error
 	if t.SignatureAlgorithms != "" {
 		// TODO FIXME: Implement (none of the signatureAndHash functions/consts are exported from common.go...?)
 		log.Fatalf("--signature-algorithms not implemented")
-	}
-
-	if t.HeartbeatEnabled || t.Heartbleed {
-		ret.HeartbeatEnabled = true
-	} else {
-		ret.HeartbeatEnabled = false
 	}
 
 	if t.DSAEnabled {
@@ -257,14 +309,26 @@ func (t *TLSFlags) GetTLSConfigForTarget(target *ScanTarget) (*tls.Config, error
 	if t.ClientRandom != "" {
 		ret.ClientRandom, err = base64.StdEncoding.DecodeString(t.ClientRandom)
 		if err != nil {
-			return nil, fmt.Errorf("Error decoding --client-random value '%s': %s", t.ClientRandom, err)
+			return nil, fmt.Errorf("error decoding --client-random value '%s': %w", t.ClientRandom, err)
 		}
 	}
 
 	if t.ClientHello != "" {
 		ret.ExternalClientHello, err = base64.StdEncoding.DecodeString(t.ClientHello)
 		if err != nil {
-			return nil, fmt.Errorf("Error decoding --client-hello value '%s': %s", t.ClientHello, err)
+			return nil, fmt.Errorf("error decoding --client-hello value '%s': %w", t.ClientHello, err)
+		}
+	}
+
+	if t.OverrideSH {
+		ret.SignatureAndHashes = []tls.SigAndHash{
+			{Signature: 0x01, Hash: 0x04}, // rsa, sha256
+			{Signature: 0x03, Hash: 0x04}, // ecdsa, sha256
+			{Signature: 0x01, Hash: 0x02}, // rsa, sha1
+			{Signature: 0x03, Hash: 0x02}, // ecdsa, sha1
+			{Signature: 0x01, Hash: 0x04}, // rsa, sha256
+			{Signature: 0x01, Hash: 0x05}, // rsa, sha384
+			{Signature: 0x01, Hash: 0x06}, // rsa, sha512
 		}
 	}
 
@@ -280,8 +344,11 @@ type TLSConnection struct {
 type TLSLog struct {
 	// TODO include TLSFlags?
 	HandshakeLog *tls.ServerHandshake `json:"handshake_log"`
-	// This will be nil if heartbleed is not checked because of client configuration flags
-	HeartbleedLog *tls.Heartbleed `json:"heartbleed_log,omitempty"`
+	JA3S         string               `json:"ja3s,omitempty"`
+	JA4S         string               `json:"ja4s,omitempty"`
+	// HandshakeCompletedSuccessfully is true only when the full TLS handshake
+	// succeeded; false on any handshake error regardless of how far it got.
+	HandshakeCompletedSuccessfully bool `json:"handshake_completed_successfully"`
 }
 
 func (z *TLSConnection) GetLog() *TLSLog {
@@ -293,61 +360,44 @@ func (z *TLSConnection) GetLog() *TLSLog {
 }
 
 func (z *TLSConnection) Handshake() error {
-	log := z.GetLog()
-	if z.flags.Heartbleed {
-		buf := make([]byte, 256)
-		defer func() {
-			log.HandshakeLog = z.Conn.GetHandshakeLog()
-			log.HeartbleedLog = z.Conn.GetHeartbleedLog()
-		}()
-		// TODO - CheckHeartbleed does not bubble errors from Handshake
-		_, err := z.CheckHeartbleed(buf)
-		if err == tls.HeartbleedError {
-			err = nil
+	tlsLog := z.GetLog()
+	defer func() {
+		tlsLog.HandshakeLog = z.GetHandshakeLog()
+		if tlsLog.HandshakeLog != nil {
+			tlsLog.JA3S = fingerprint.JA3S(tlsLog.HandshakeLog)
+			if z.flags != nil && z.flags.EnableJA4SSignatures {
+				tlsLog.JA4S = fingerprint.JA4S(fingerprint.JA4SProtocolTLS, tlsLog.HandshakeLog)
+			}
 		}
-		return err
-	} else {
-		defer func() {
-			log.HandshakeLog = z.Conn.GetHandshakeLog()
-			log.HeartbleedLog = nil
-		}()
-		return z.Conn.Handshake()
+	}()
+	err := z.Conn.Handshake()
+	if err == nil {
+		tlsLog.HandshakeCompletedSuccessfully = true
 	}
+
+	return err
+}
+
+func (z *TLSConnection) HandshakeContext(ctx context.Context) error {
+	tlsLog := z.GetLog()
+	defer func() {
+		tlsLog.HandshakeLog = z.GetHandshakeLog()
+		if tlsLog.HandshakeLog != nil {
+			tlsLog.JA3S = fingerprint.JA3S(tlsLog.HandshakeLog)
+			if z.flags != nil && z.flags.EnableJA4SSignatures {
+				tlsLog.JA4S = fingerprint.JA4S(fingerprint.JA4SProtocolTLS, tlsLog.HandshakeLog)
+			}
+		}
+	}()
+	err := z.Conn.HandshakeContext(ctx)
+	if err == nil {
+		tlsLog.HandshakeCompletedSuccessfully = true
+	}
+
+	return err
 }
 
 // Close the underlying connection.
 func (conn *TLSConnection) Close() error {
 	return conn.Conn.Close()
-}
-
-// Connect opens the TCP connection to the target using the given configuration,
-// and then returns the configured wrapped TLS connection. The caller must still
-// call Handshake().
-func (t *TLSFlags) Connect(target *ScanTarget, flags *BaseFlags) (*TLSConnection, error) {
-	tcpConn, err := target.Open(flags)
-	if err != nil {
-		return nil, err
-	}
-	return t.GetTLSConnectionForTarget(tcpConn, target)
-}
-
-func (t *TLSFlags) GetTLSConnection(conn net.Conn) (*TLSConnection, error) {
-	return t.GetTLSConnectionForTarget(conn, nil)
-}
-
-func (t *TLSFlags) GetTLSConnectionForTarget(conn net.Conn, target *ScanTarget) (*TLSConnection, error) {
-	cfg, err := t.GetTLSConfigForTarget(target)
-	if err != nil {
-		return nil, fmt.Errorf("Error getting TLSConfig for options: %s", err)
-	}
-	return t.GetWrappedConnection(conn, cfg), nil
-}
-
-func (t *TLSFlags) GetWrappedConnection(conn net.Conn, cfg *tls.Config) *TLSConnection {
-	tlsClient := tls.Client(conn, cfg)
-	wrappedClient := TLSConnection{
-		Conn:  *tlsClient,
-		flags: t,
-	}
-	return &wrappedClient
 }

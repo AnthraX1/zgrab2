@@ -163,7 +163,7 @@ func getConnection() (*Connection, *fakeIO) {
 }
 
 // strip s down to 32 chars
-func strip(s interface{}) string {
+func strip(s any) string {
 	var stringVal string
 	switch v := s.(type) {
 	case SimpleString:
@@ -188,25 +188,6 @@ func assertEquals(t *testing.T, actual string, expected string) {
 	if actual != expected {
 		t.Errorf("Expected [<%s>], got [<%s>]", strip(expected), strip(actual))
 	}
-}
-
-// Read a value from the connection, or throw a fatal error
-func rawRead(t *testing.T, conn *Connection) RedisValue {
-	ret, err := conn.ReadRedisValue()
-	if err != nil {
-		t.Fatalf("Error reading value: %v", err)
-	}
-	return ret
-}
-
-// Read a value from the connection and convert it to a string for easy comparison
-func read(t *testing.T, conn *Connection) string {
-	ret := rawRead(t, conn)
-	b, ok := ret.(BulkString)
-	if ok {
-		return string(b)
-	}
-	return fmt.Sprintf("%v", ret)
 }
 
 // Encode a value and return a string for easy comparison
@@ -364,7 +345,7 @@ func TestRedisArray(t *testing.T) {
 	conn, io := getConnection()
 
 	// Slowly build up array, checking its encoding after each element is added
-	var array RedisArray
+	array := make(RedisArray, 0, 6) // Prealloc
 	e0 := SimpleString("foo")
 	e1 := BulkString([]byte(bigBulkString))
 	e2 := Integer(0)

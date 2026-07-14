@@ -10,14 +10,18 @@
 package postgres
 
 import (
+	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 
 	"encoding/json"
 
 	log "github.com/sirupsen/logrus"
+
 	"github.com/zmap/zgrab2"
 )
 
@@ -116,25 +120,22 @@ type AuthenticationMode struct {
 // Flags sets the module-specific flags that can be passed in from the
 // command line.
 type Flags struct {
-	zgrab2.BaseFlags
-	zgrab2.TLSFlags
-	SkipSSL         bool   `long:"skip-ssl" description:"If set, do not attempt to negotiate an SSL connection"`
-	Verbose         bool   `long:"verbose" description:"More verbose logging, include debug fields in the scan results"`
-	ProtocolVersion string `long:"protocol-version" description:"The protocol to use in the StartupPacket" default:"3.0"`
-	User            string `long:"user" description:"Username to pass to StartupMessage. If omitted, no user will be sent." default:""`
-	Database        string `long:"database" description:"Database to pass to StartupMessage. If omitted, none will be sent." default:""`
-	ApplicationName string `long:"application-name" description:"application_name value to pass in StartupMessage. If omitted, none will be sent." default:""`
+	zgrab2.BaseFlags `group:"Basic Options"`
+	zgrab2.TLSFlags  `group:"TLS Options"`
+	SkipSSL          bool   `long:"skip-ssl" description:"If set, do not attempt to negotiate an SSL connection"`
+	ProtocolVersion  string `long:"protocol-version" description:"The protocol to use in the StartupPacket" default:"3.0"`
+	User             string `long:"user" description:"Username to pass to StartupMessage. If omitted, no user will be sent." default:""`
+	Database         string `long:"database" description:"Database to pass to StartupMessage. If omitted, none will be sent." default:""`
+	ApplicationName  string `long:"application-name" description:"application_name value to pass in StartupMessage. If omitted, none will be sent." default:""`
 }
 
 // Scanner is the zgrab2 scanner type for the postgres protocol
 type Scanner struct {
+	zgrab2.BaseScanner
 	Config *Flags
 }
 
 // Module is the zgrab2 module for the postgres protocol
-type Module struct {
-}
-
 // decodeAuthMode() decodes the body of an 'R'-type packet and returns a friendlier description of it
 func decodeAuthMode(buf []byte) *AuthenticationMode {
 	// See the 'R' messages in https://www.postgresql.org/docs/10/static/protocol-message-formats.html
@@ -270,95 +271,71 @@ func (results *Results) decodeServerResponse(packets []*ServerPacket) {
 	}
 }
 
-// NewFlags returns a default Flags instance.
-func (m *Module) NewFlags() interface{} {
-	return new(Flags)
-}
-
-// NewScanner returns the module's zgrab2.Scanner implementation.
-func (m *Module) NewScanner() zgrab2.Scanner {
-	return new(Scanner)
-}
-
-// Description returns an overview of this module.
-func (m *Module) Description() string {
-	return "Perform a handshake with a PostgreSQL server"
-}
-
-// Validate checks the arguments; on success, returns nil.
-func (f *Flags) Validate(args []string) error {
-	return nil
-}
-
-// Help returns the module's help string.
-func (f *Flags) Help() string {
-	return ""
+func NewModule() *zgrab2.TypedModule[Flags, Scanner, *Scanner] {
+	return zgrab2.NewTypedModule[Flags, Scanner, *Scanner]("postgres", "PostgreSQL (Postgres)", "Perform a handshake with a PostgreSQL server", 5432)
 }
 
 // Init initializes the scanner with the given flags.
-func (s *Scanner) Init(flags zgrab2.ScanFlags) error {
+func (scanner *Scanner) Init(flags zgrab2.ScanFlags) error {
 	f, _ := flags.(*Flags)
-	s.Config = f
+	scanner.Config = f
 	if f.Verbose {
 		log.SetLevel(log.DebugLevel)
 	}
+	scanner.SetBaseFlags(&f.BaseFlags)
+	scanner.DialerGroupConfig = &zgrab2.DialerGroupConfig{
+		TransportAgnosticDialerProtocol: zgrab2.TransportTCP,
+		NeedSeparateL4Dialer:            true,
+		BaseFlags:                       &f.BaseFlags,
+		TLSEnabled:                      true,
+		TLSFlags:                        &f.TLSFlags,
+	}
 	return nil
-}
-
-// InitPerSender does nothing in this module.
-func (s *Scanner) InitPerSender(senderID int) error {
-	return nil
-}
-
-// Protocol returns the protocol identifer for the scanner.
-func (s *Scanner) Protocol() string {
-	return "postgres"
-}
-
-// GetName returns the name from the parameters.
-func (s *Scanner) GetName() string {
-	return s.Config.Name
-}
-
-// GetTrigger returns the Trigger defined in the Flags.
-func (s *Scanner) GetTrigger() string {
-	return s.Config.Trigger
 }
 
 // DoSSL attempts to upgrade the connection to SSL, returning an error on failure.
-func (s *Scanner) DoSSL(sql *Connection) error {
+func (scanner *Scanner) DoSSL(ctx context.Context, sql *Connection, dialGroup *zgrab2.DialerGroup) error {
 	var conn *zgrab2.TLSConnection
 	var err error
-	if conn, err = s.Config.TLSFlags.GetTLSConnection(sql.Connection); err != nil {
-		return err
+	tlsWrapper := dialGroup.TLSWrapper
+	if tlsWrapper == nil {
+		return errors.New("dial group does not have a TLS wrapper")
 	}
-	if err = conn.Handshake(); err != nil {
-		return err
+	conn, err = tlsWrapper(ctx, sql.Target, sql.Connection)
+	if conn != nil {
+		// Store even on failure so GetTLSLog captures partial handshake data.
+		sql.Connection = conn
 	}
-	// Replace sql.Connection to allow future calls to go over the secure connection
-	sql.Connection = conn
+	if err != nil {
+		return fmt.Errorf("could not wrap connection in TLS to %s: %w", sql.Target.String(), err)
+	}
+
 	return nil
 }
 
 // newConnection opens up a new connection to the ScanTarget, and if necessary, attempts to update the connection to SSL
-func (s *Scanner) newConnection(t *zgrab2.ScanTarget, mgr *connectionManager, nossl bool) (*Connection, *zgrab2.ScanError) {
+func (scanner *Scanner) newConnection(ctx context.Context, target *zgrab2.ScanTarget, mgr *connectionManager, useSSL bool, dialGroup *zgrab2.DialerGroup) (*Connection, *zgrab2.ScanError) {
 	var conn net.Conn
 	var err error
+	l4Dialer := dialGroup.L4Dialer
+	if l4Dialer == nil {
+		return nil, zgrab2.DetectScanError(errors.New("l4 dialer is required for postgres"))
+	}
 	// Open a managed connection to the ScanTarget, register it for automatic cleanup
-	if conn, err = t.Open(&s.Config.BaseFlags); err != nil {
-		return nil, zgrab2.DetectScanError(err)
+	if conn, err = l4Dialer(target)(ctx, "tcp", net.JoinHostPort(target.Host(), strconv.Itoa(int(target.Port)))); err != nil {
+		return nil, zgrab2.DetectScanError(fmt.Errorf("could not establish connection to %s: %w", target.String(), err))
 	}
 	mgr.addConnection(conn)
-	sql := Connection{Target: t, Connection: conn, Config: s.Config}
+	sql := Connection{Target: target, Connection: conn, Config: scanner.Config}
 	sql.IsSSL = false
-	if !nossl && !s.Config.SkipSSL {
+	if useSSL && !scanner.Config.SkipSSL {
 		hasSSL, sslError := sql.RequestSSL()
 		if sslError != nil {
 			return nil, sslError
 		}
 		if hasSSL {
-			if err = s.DoSSL(&sql); err != nil {
-				return nil, zgrab2.NewScanError(zgrab2.SCAN_APPLICATION_ERROR, err)
+			if err = scanner.DoSSL(ctx, &sql, dialGroup); err != nil {
+				return nil, zgrab2.NewScanError(zgrab2.SCAN_HANDSHAKE_ERROR, err)
 			}
 			sql.IsSSL = true
 		}
@@ -367,7 +344,7 @@ func (s *Scanner) newConnection(t *zgrab2.ScanTarget, mgr *connectionManager, no
 }
 
 // Return the default KVPs used for all Startup messages
-func (s *Scanner) getDefaultKVPs() map[string]string {
+func (scanner *Scanner) getDefaultKVPs() map[string]string {
 	return map[string]string{
 		"client_encoding": "UTF8",
 		"datestyle":       "ISO, MDY",
@@ -396,17 +373,21 @@ func (s *Scanner) getDefaultKVPs() map[string]string {
 //
 //     - NOTE: TLS is only used for the first connection, and then only if
 //     both client and server support it.
-func (s *Scanner) Scan(t zgrab2.ScanTarget) (status zgrab2.ScanStatus, result interface{}, thrown error) {
+func (scanner *Scanner) Scan(ctx context.Context, dialGroup *zgrab2.DialerGroup, target *zgrab2.ScanTarget) (zgrab2.ScanStatus, any, error) {
 	var results Results
 
 	mgr := newConnectionManager()
 	defer mgr.cleanUp()
-
 	// Send too-low protocol version (0.0) StartupMessage to get a simple supported-protocols error string
 	// Also do TLS handshake, if configured / supported
-	{
-		sql, connectErr := s.newConnection(&t, mgr, false)
+	// Retry without TLS if we get an ErrorResponse from the SSLRequest
+	for i := range 2 {
+		useSSL := i == 0 // only use TLS on first attempt
+		sql, connectErr := scanner.newConnection(ctx, target, mgr, useSSL, dialGroup)
 		if connectErr != nil {
+			if connectErr.Status == zgrab2.SCAN_APPLICATION_ERROR {
+				continue
+			}
 			return connectErr.Unpack(nil)
 		}
 		defer mgr.closeConnection(sql)
@@ -441,11 +422,12 @@ func (s *Scanner) Scan(t zgrab2.ScanTarget) (status zgrab2.ScanStatus, result in
 			return err.Unpack(&results)
 		}
 		mgr.closeConnection(sql)
+		break
 	}
 
 	// Send too-high protocol version (255.255) StartupMessage to get full error message (including line numbers, useful for probing server version)
 	{
-		sql, connectErr := s.newConnection(&t, mgr, true)
+		sql, connectErr := scanner.newConnection(ctx, target, mgr, false, dialGroup)
 		if connectErr != nil {
 			return connectErr.Unpack(&results)
 		}
@@ -479,13 +461,13 @@ func (s *Scanner) Scan(t zgrab2.ScanTarget) (status zgrab2.ScanStatus, result in
 		var err error
 		var response *ServerPacket
 		var readErr *zgrab2.ScanError
-		sql, connectErr := s.newConnection(&t, mgr, true)
+		sql, connectErr := scanner.newConnection(ctx, target, mgr, false, dialGroup)
 		if connectErr != nil {
 			return connectErr.Unpack(&results)
 		}
 		defer mgr.closeConnection(sql)
 
-		if err = sql.SendStartupMessage(s.Config.ProtocolVersion, s.getDefaultKVPs()); err != nil {
+		if err = sql.SendStartupMessage(scanner.Config.ProtocolVersion, scanner.getDefaultKVPs()); err != nil {
 			return zgrab2.SCAN_PROTOCOL_ERROR, &results, err
 		}
 		if response, readErr = sql.ReadPacket(); readErr != nil {
@@ -507,24 +489,24 @@ func (s *Scanner) Scan(t zgrab2.ScanTarget) (status zgrab2.ScanStatus, result in
 	}
 
 	// If user / database / application_name are provided, do a final scan with those
-	if s.Config.User != "" || s.Config.Database != "" || s.Config.ApplicationName != "" {
-		sql, connectErr := s.newConnection(&t, mgr, false)
+	if scanner.Config.User != "" || scanner.Config.Database != "" || scanner.Config.ApplicationName != "" {
+		sql, connectErr := scanner.newConnection(ctx, target, mgr, true, dialGroup)
 		if connectErr != nil {
 			return connectErr.Unpack(&results)
 		}
 		defer mgr.closeConnection(sql)
 
-		kvps := s.getDefaultKVPs()
-		if s.Config.User != "" {
-			kvps["user"] = s.Config.User
+		kvps := scanner.getDefaultKVPs()
+		if scanner.Config.User != "" {
+			kvps["user"] = scanner.Config.User
 		}
-		if s.Config.Database != "" {
-			kvps["database"] = s.Config.Database
+		if scanner.Config.Database != "" {
+			kvps["database"] = scanner.Config.Database
 		}
-		if s.Config.ApplicationName != "" {
-			kvps["application_name"] = s.Config.ApplicationName
+		if scanner.Config.ApplicationName != "" {
+			kvps["application_name"] = scanner.Config.ApplicationName
 		}
-		if err := sql.SendStartupMessage(s.Config.ProtocolVersion, kvps); err != nil {
+		if err := sql.SendStartupMessage(scanner.Config.ProtocolVersion, kvps); err != nil {
 			return zgrab2.SCAN_PROTOCOL_ERROR, &results, err
 		}
 		packets, err := sql.ReadAll()
@@ -536,15 +518,5 @@ func (s *Scanner) Scan(t zgrab2.ScanTarget) (status zgrab2.ScanStatus, result in
 			return err.Unpack(&results)
 		}
 	}
-	return zgrab2.SCAN_SUCCESS, &results, thrown
-}
-
-// RegisterModule is called by modules/postgres.go's init(), to register
-// the postgres module with the zgrab2 framework.
-func RegisterModule() {
-	var module Module
-	_, err := zgrab2.AddCommand("postgres", "Postgres", module.Description(), 5432, &module)
-	if err != nil {
-		log.Fatal(err)
-	}
+	return zgrab2.SCAN_SUCCESS, &results, nil
 }

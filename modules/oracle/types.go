@@ -119,7 +119,7 @@ func getSliceReader(data []byte) *sliceReader {
 }
 
 func (reader *sliceReader) Read(output []byte) (int, error) {
-	if reader.Data == nil {
+	if len(reader.Data) == 0 {
 		return 0, io.EOF
 	}
 	n := len(output)
@@ -282,21 +282,21 @@ func (flags ServiceOptions) Set() map[string]bool {
 
 const (
 	SOBrokenConnectNotify ServiceOptions = 0x2000
-	SOPacketChecksum                     = 0x1000
-	SOHeaderChecksum                     = 0x0800
-	SOFullDuplex                         = 0x0400
-	SOHalfDuplex                         = 0x0200
-	SOUnknown0100                        = 0x0100
-	SOUnknown0080                        = 0x0080
-	SOUnknown0040                        = 0x0040
-	SOUnknown0020                        = 0x0020
-	SODirectIO                           = 0x0010
-	SOAttentionProcessing                = 0x0008
-	SOCanReceiveAttention                = 0x0004
-	SOCanSendAttention                   = 0x0002
-	SOUnknown0001                        = 0x0001
-	SOUnknown4000                        = 0x4000
-	SOUnknown8000                        = 0x8000
+	SOPacketChecksum      ServiceOptions = 0x1000
+	SOHeaderChecksum      ServiceOptions = 0x0800
+	SOFullDuplex          ServiceOptions = 0x0400
+	SOHalfDuplex          ServiceOptions = 0x0200
+	SOUnknown0100         ServiceOptions = 0x0100
+	SOUnknown0080         ServiceOptions = 0x0080
+	SOUnknown0040         ServiceOptions = 0x0040
+	SOUnknown0020         ServiceOptions = 0x0020
+	SODirectIO            ServiceOptions = 0x0010
+	SOAttentionProcessing ServiceOptions = 0x0008
+	SOCanReceiveAttention ServiceOptions = 0x0004
+	SOCanSendAttention    ServiceOptions = 0x0002
+	SOUnknown0001         ServiceOptions = 0x0001
+	SOUnknown4000         ServiceOptions = 0x4000
+	SOUnknown8000         ServiceOptions = 0x8000
 )
 
 var soNames = map[ServiceOptions]string{
@@ -324,21 +324,21 @@ type NTProtocolCharacteristics uint16
 
 const (
 	NTPCHangon           NTProtocolCharacteristics = 0x8000
-	NTPCConfirmedRelease                           = 0x4000
-	NTPCTDUBasedIO                                 = 0x2000
-	NTPCSpawnerRunning                             = 0x1000
-	NTPCDataTest                                   = 0x0800
-	NTPCCallbackIO                                 = 0x0400
-	NTPCAsyncIO                                    = 0x0200
-	NTPCPacketIO                                   = 0x0100
-	NTPCCanGrant                                   = 0x0080
-	NTPCCanHandoff                                 = 0x0040
-	NTPCGenerateSIGIO                              = 0x0020
-	NTPCGenerateSIGPIPE                            = 0x0010
-	NTPCGenerateSIGURG                             = 0x0008
-	NTPCUrgentIO                                   = 0x0004
-	NTPCFullDuplex                                 = 0x0002
-	NTPCTestOperation                              = 0x0001
+	NTPCConfirmedRelease NTProtocolCharacteristics = 0x4000
+	NTPCTDUBasedIO       NTProtocolCharacteristics = 0x2000
+	NTPCSpawnerRunning   NTProtocolCharacteristics = 0x1000
+	NTPCDataTest         NTProtocolCharacteristics = 0x0800
+	NTPCCallbackIO       NTProtocolCharacteristics = 0x0400
+	NTPCAsyncIO          NTProtocolCharacteristics = 0x0200
+	NTPCPacketIO         NTProtocolCharacteristics = 0x0100
+	NTPCCanGrant         NTProtocolCharacteristics = 0x0080
+	NTPCCanHandoff       NTProtocolCharacteristics = 0x0040
+	NTPCGenerateSIGIO    NTProtocolCharacteristics = 0x0020
+	NTPCGenerateSIGPIPE  NTProtocolCharacteristics = 0x0010
+	NTPCGenerateSIGURG   NTProtocolCharacteristics = 0x0008
+	NTPCUrgentIO         NTProtocolCharacteristics = 0x0004
+	NTPCFullDuplex       NTProtocolCharacteristics = 0x0002
+	NTPCTestOperation    NTProtocolCharacteristics = 0x0001
 )
 
 var ntpcNames = map[NTProtocolCharacteristics]string{
@@ -378,13 +378,13 @@ type ConnectFlags uint8
 
 const (
 	CFServicesWanted      ConnectFlags = 0x01
-	CFInterchangeInvolved              = 0x02
-	CFServicesEnabled                  = 0x04
-	CFServicesLinkedIn                 = 0x08
-	CFServicesRequired                 = 0x10
-	CFUnknown20                        = 0x20
-	CFUnknown40                        = 0x40
-	CFUnknown80                        = 0x80
+	CFInterchangeInvolved ConnectFlags = 0x02
+	CFServicesEnabled     ConnectFlags = 0x04
+	CFServicesLinkedIn    ConnectFlags = 0x08
+	CFServicesRequired    ConnectFlags = 0x10
+	CFUnknown20           ConnectFlags = 0x20
+	CFUnknown40           ConnectFlags = 0x40
+	CFUnknown80           ConnectFlags = 0x80
 )
 
 var cfNames = map[ConnectFlags]string{
@@ -580,7 +580,7 @@ func startReading(reader io.Reader) *chainedReader {
 
 // read the value from the stream, unless there was a previous error on the
 // reader. Uses binary.Read() to decode the data. dest must be a pointer.
-func (reader *chainedReader) read(dest interface{}) *chainedReader {
+func (reader *chainedReader) read(dest any) *chainedReader {
 	if reader.err != nil {
 		return reader
 	}
@@ -592,6 +592,13 @@ func (reader *chainedReader) read(dest interface{}) *chainedReader {
 // the buffer in *dest, unless there was a previous error on the reader.
 func (reader *chainedReader) readNew(dest *[]byte, size int) *chainedReader {
 	if reader.err != nil {
+		return reader
+	}
+	// TNS packets are limited to uint16 length; reject sizes that indicate
+	// arithmetic underflow (e.g. uint16 subtraction wrapping) or that would
+	// cause excessive allocation.
+	if size < 0 || size > 0xFFFF {
+		reader.err = ErrInvalidData
 		return reader
 	}
 	ret := make([]byte, size)
@@ -664,6 +671,9 @@ func ReadTNSConnect(reader io.Reader, header *TNSHeader) (*TNSConnect, error) {
 	next.read(&ret.CrossFacility1)
 	next.read(&ret.ConnectionID0)
 	next.read(&ret.ConnectionID1)
+	if ret.DataOffset < 0x3A {
+		return nil, ErrInvalidData
+	}
 	unknownLen := ret.DataOffset - 0x3A
 	next.readNew(&ret.Unknown3A, int(unknownLen))
 	next.readNewString(&ret.ConnectDescriptor, int(ret.DataLength))
@@ -788,6 +798,9 @@ func ReadTNSAccept(reader io.Reader, header *TNSHeader) (*TNSAccept, error) {
 	next.read(&ret.DataOffset)
 	next.read(&ret.ConnectFlags0)
 	next.read(&ret.ConnectFlags1)
+	if ret.DataOffset < 24 {
+		return nil, ErrInvalidData
+	}
 	unknownLen := ret.DataOffset - 16 - 8
 	next.readNew(&ret.Unknown18, int(unknownLen))
 	next.readNew(&ret.AcceptData, int(ret.DataLength))
@@ -891,6 +904,9 @@ func (packet *TNSRedirect) GetType() PacketType {
 // ReadTNSRedirect reads a TNSRedirect packet from the stream, which should
 // point to the first byte after the TNSHeader.
 func ReadTNSRedirect(reader io.Reader, header *TNSHeader) (*TNSRedirect, error) {
+	if header.Length < 10 {
+		return nil, ErrInvalidData
+	}
 	ret := new(TNSRedirect)
 	next := startReading(reader)
 	next.read(&ret.DataLength)
@@ -967,21 +983,21 @@ type DataFlags uint16
 // TODO: details
 const (
 	DFSendToken           DataFlags = 0x0001
-	DFRequestConfirmation           = 0x0002
-	DFConfirmation                  = 0x0004
-	DFReserved                      = 0x0008
-	DFUnknown0010                   = 0x0010
-	DFMoreData                      = 0x0020
-	DFEOF                           = 0x0040
-	DFConfirmImmediately            = 0x0080
-	DFRequestToSend                 = 0x0100
-	DFSendNTTrailer                 = 0x0200
-	DFUnknown0400                   = 0x0400
-	DFUnknown0800                   = 0x0800
-	DFUnknown1000                   = 0x1000
-	DFUnknown2000                   = 0x2000
-	DFUnknown4000                   = 0x4000
-	DFUnknown8000                   = 0x8000
+	DFRequestConfirmation DataFlags = 0x0002
+	DFConfirmation        DataFlags = 0x0004
+	DFReserved            DataFlags = 0x0008
+	DFUnknown0010         DataFlags = 0x0010
+	DFMoreData            DataFlags = 0x0020
+	DFEOF                 DataFlags = 0x0040
+	DFConfirmImmediately  DataFlags = 0x0080
+	DFRequestToSend       DataFlags = 0x0100
+	DFSendNTTrailer       DataFlags = 0x0200
+	DFUnknown0400         DataFlags = 0x0400
+	DFUnknown0800         DataFlags = 0x0800
+	DFUnknown1000         DataFlags = 0x1000
+	DFUnknown2000         DataFlags = 0x2000
+	DFUnknown4000         DataFlags = 0x4000
+	DFUnknown8000         DataFlags = 0x8000
 )
 
 var dfNames = map[DataFlags]string{
@@ -1058,6 +1074,9 @@ func (packet *TNSData) GetType() PacketType {
 // ReadTNSData reads a TNSData packet from the stream, which should point to the
 // first byte after the TNSHeader.
 func ReadTNSData(reader io.Reader, header *TNSHeader) (*TNSData, error) {
+	if header.Length < 10 {
+		return nil, ErrInvalidData
+	}
 	ret := new(TNSData)
 	next := startReading(reader)
 	next.read(&ret.DataFlags)
@@ -1235,15 +1254,15 @@ func (value *NSNValue) String() string {
 	case NSNValueTypeBytes:
 		return base64.StdEncoding.EncodeToString(value.Value)
 	case NSNValueTypeUB1:
-		return fmt.Sprintf("%d", value.Value[0])
+		return strconv.Itoa(int(value.Value[0]))
 	case NSNValueTypeUB4:
-		return fmt.Sprintf("%d", binary.BigEndian.Uint32(value.Value))
+		return strconv.Itoa(int(binary.BigEndian.Uint32(value.Value)))
 	case NSNValueTypeVersion:
 		return ReleaseVersion(binary.BigEndian.Uint32(value.Value)).String()
 	case NSNValueTypeStatus:
 		fallthrough
 	case NSNValueTypeUB2:
-		return fmt.Sprintf("%d", binary.BigEndian.Uint16(value.Value))
+		return strconv.Itoa(int(binary.BigEndian.Uint16(value.Value)))
 	default:
 		return base64.StdEncoding.EncodeToString(value.Value)
 	}
@@ -1253,7 +1272,7 @@ func (value *NSNValue) String() string {
 func (value *NSNValue) MarshalJSON() ([]byte, error) {
 	type Aux struct {
 		Type  NSNValueType `json:"type"`
-		Value interface{}  `json:"value"`
+		Value any          `json:"value"`
 	}
 	ret := Aux{
 		Type: value.Type,
@@ -1473,13 +1492,13 @@ func ReadTNSDataNSN(reader io.Reader) (*TNSDataNSN, error) {
 	next.read(&ret.Options)
 	// TODO: Check for valid options?
 
-	if err := next.Error(); err != nil {
+	if err = next.Error(); err != nil {
 		return nil, err
 	}
 
 	ret.Services = make([]NSNService, n)
 	for i := 0; i < int(n); i++ {
-		_, err := ReadNSNService(reader, &ret.Services[i])
+		_, err = ReadNSNService(reader, &ret.Services[i])
 		if err != nil {
 			return nil, err
 		}
@@ -1600,11 +1619,17 @@ func DecodeDescriptor(descriptor string) (Descriptor, error) {
 			rest = strings.TrimSpace(rest[eq:])
 		case ')':
 			// Close paren: pop off the last 'object' suffix
+			if len(path) == 0 {
+				return nil, ErrInvalidData
+			}
 			path = path[0 : len(path)-1]
 			// Consume the ')'
 			rest = strings.TrimSpace(rest[1:])
 		case '=':
 			rest = strings.TrimSpace(rest[1:])
+			if len(rest) == 0 {
+				return nil, ErrInvalidData
+			}
 			if rest[0] != '(' {
 				// What follows is a primitive
 				closer := -1
@@ -1630,9 +1655,8 @@ func DecodeDescriptor(descriptor string) (Descriptor, error) {
 				ret = append(ret, DescriptorEntry{key, value})
 				// Consume the value
 				rest = strings.TrimSpace(rest[closer:])
-			} else {
-				// What follows is a list -- already consumed the =
 			}
+			// else - What follows is a list -- already consumed the =
 		default:
 			return nil, ErrInvalidData
 		}

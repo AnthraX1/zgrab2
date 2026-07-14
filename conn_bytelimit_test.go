@@ -11,17 +11,20 @@ import (
 )
 
 // Start a local echo server on port.
-func runEchoServer(t *testing.T, port int) {
+func runEchoServer(t *testing.T, port int) <-chan error {
 	endpoint := fmt.Sprintf("127.0.0.1:%d", port)
 	listener, err := net.Listen("tcp", endpoint)
 	if err != nil {
 		t.Fatal(err)
 	}
+	errChan := make(chan error)
 	go func() {
+		defer close(errChan)
 		defer listener.Close()
 		sock, err := listener.Accept()
 		if err != nil {
-			t.Fatal(err)
+			errChan <- err
+			return
 		}
 		defer sock.Close()
 
@@ -30,12 +33,12 @@ func runEchoServer(t *testing.T, port int) {
 			n, err := sock.Read(buf)
 			if err != nil {
 				if err != io.EOF && !strings.Contains(err.Error(), "connection reset") {
-					t.Fatal(err)
+					errChan <- err
 				}
 				return
 			}
 			sock.SetWriteDeadline(time.Now().Add(time.Millisecond * 250))
-			n, err = sock.Write(buf[0:n])
+			_, err = sock.Write(buf[0:n])
 			if err != nil {
 				if err != io.EOF && !strings.Contains(err.Error(), "connection reset") && !strings.Contains(err.Error(), "broken pipe") {
 					t.Logf("Unexpected error writing to client: %v", err)
@@ -44,6 +47,7 @@ func runEchoServer(t *testing.T, port int) {
 			}
 		}
 	}()
+	return errChan
 }
 
 // Interface for getting a TimeoutConnection; we want to test both the dialer and the direct Dial functions.
@@ -65,8 +69,8 @@ type readLimitTestConfig struct {
 // Call sendReceive(), and check that the input/output match, and that any expected errors / truncation occurs.
 func checkedSendReceive(t *testing.T, conn *TimeoutConnection, size int) (result error) {
 	// helper to report + return an error
-	tErrorf := func(format string, args ...interface{}) error {
-		result = fmt.Errorf(format, args)
+	tErrorf := func(format string, args ...any) error {
+		result = fmt.Errorf(format, args...)
 		t.Error(result)
 		return result
 	}
@@ -185,7 +189,7 @@ func getTestBuffer(size int) []byte {
 
 // Check that buf is of the type returned by getTestBuffer.
 func checkTestBuffer(buf []byte) bool {
-	if buf == nil || len(buf) == 0 {
+	if len(buf) == 0 {
 		return false
 	}
 	for i, v := range buf {
@@ -257,7 +261,15 @@ type directDial struct {
 }
 
 func (d *directDial) connect(ctx context.Context, t *testing.T, port int, idx int) (*TimeoutConnection, error) {
-	conn, err := DialTimeoutConnectionEx("tcp", fmt.Sprintf("127.0.0.1:%d", port), time.Second, time.Second, time.Second, time.Second, d.limit)
+	dialer := NewDialer(&Dialer{
+		SessionTimeout: time.Second,
+		BytesReadLimit: d.limit,
+		ReadTimeout:    time.Second,
+		WriteTimeout:   time.Second,
+	})
+
+	conn, err := dialer.DialContext(ctx, "tcp", fmt.Sprintf("127.0.0.1:%d", port))
+
 	var ret *TimeoutConnection
 	if conn != nil {
 		ret = conn.(*TimeoutConnection)
@@ -336,7 +348,7 @@ func runBytesReadLimitTrial(t *testing.T, connector timeoutConnector, idx int, m
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	port := 0x1234 + idx
-	runEchoServer(t, port)
+	errChan := runEchoServer(t, port)
 	conn, err := connector.connect(ctx, t, port, idx)
 	if err != nil {
 		t.Fatalf("Error dialing: %v", err)
@@ -352,7 +364,19 @@ func runBytesReadLimitTrial(t *testing.T, connector timeoutConnector, idx int, m
 		}
 	}()
 	defer conn.Close()
-	return method(cfg, t, conn, idx)
+	err = method(cfg, t, conn, idx)
+	if err != nil {
+		return err
+	}
+	// Check if the server has any errors
+	select {
+	case err := <-errChan:
+		if err != nil {
+			t.Fatalf("Error in server: %v", err)
+		}
+	default:
+	}
+	return nil
 }
 
 // Run a full set of trials on the connector -- ten with a single send, and ten with multiple sends.
@@ -362,11 +386,12 @@ func testBytesReadLimitOn(t *testing.T, connector timeoutConnector) error {
 			return err
 		}
 	}
-	for i := 0; i < 10; i++ {
+	for i := 10; i < 20; i++ {
 		if err := runBytesReadLimitTrial(t, connector, i, readLimitTestConfig.runMultiSend); err != nil {
 			return err
 		}
 	}
+	time.Sleep(1 * time.Second)
 	return nil
 }
 
@@ -378,6 +403,9 @@ func testBytesReadLimitOn(t *testing.T, connector timeoutConnector) error {
 // 5. Repeat 10 times
 // 6. Repeat the above 10 more times, except in #3, split the send across five packets
 func TestBytesReadLimit(t *testing.T) {
+	// Higher limits for testing
+	config.ServerRateLimit = 1_000
+	config.DNSServerRateLimit = 1_000
 	connectors := make(map[string]timeoutConnector)
 	// Create a fresh connector for each configuration
 	for cfgName, cfg := range readLimitTestConfigs {

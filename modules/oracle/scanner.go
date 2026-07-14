@@ -21,10 +21,12 @@
 package oracle
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 
 	log "github.com/sirupsen/logrus"
+
 	"github.com/zmap/zgrab2"
 )
 
@@ -41,8 +43,8 @@ type ScanResults struct {
 // Flags holds the command-line configuration for the HTTP scan module.
 // Populated by the framework.
 type Flags struct {
-	zgrab2.BaseFlags
-	zgrab2.TLSFlags
+	zgrab2.BaseFlags `group:"Basic Options"`
+	zgrab2.TLSFlags  `group:"TLS Options"`
 
 	// Version is the client version number sent to the server in the Connect
 	// packet. TODO: Find version number mappings.
@@ -88,49 +90,22 @@ type Flags struct {
 	// NewTNS causes the client to use the newer TNS header format with 32-bit
 	// lengths.
 	NewTNS bool `long:"new-tns" description:"If set, use new-style TNS headers"`
-
-	// Verbose causes more verbose logging, and includes debug fields inthe scan
-	// results.
-	Verbose bool `long:"verbose" description:"More verbose logging, include debug fields in the scan results"`
 }
 
-// Module implements the zgrab2.Module interface.
-type Module struct {
+func NewModule() *zgrab2.TypedModule[Flags, Scanner, *Scanner] {
+	return zgrab2.NewTypedModule[Flags, Scanner, *Scanner]("oracle", "Oracle's Transparent Network Substrate Protocol (Oracle)", "Perform a handshake with Oracle database servers", 1521)
 }
 
 // Scanner implements the zgrab2.Scanner interface.
 type Scanner struct {
+	zgrab2.BaseScanner
 	config *Flags
-}
-
-// RegisterModule registers the zgrab2 module.
-func RegisterModule() {
-	var module Module
-	_, err := zgrab2.AddCommand("oracle", "oracle", module.Description(), 1521, &module)
-	if err != nil {
-		log.Fatal(err)
-	}
-}
-
-// NewFlags returns a default Flags object.
-func (module *Module) NewFlags() interface{} {
-	return new(Flags)
-}
-
-// NewScanner returns a new Scanner instance.
-func (module *Module) NewScanner() zgrab2.Scanner {
-	return new(Scanner)
-}
-
-// Description returns an overview of this module.
-func (module *Module) Description() string {
-	return "Perform a handshake with Oracle database servers"
 }
 
 // Validate checks that the flags are valid.
 // On success, returns nil.
 // On failure, returns an error instance describing the error.
-func (flags *Flags) Validate(args []string) error {
+func (flags Flags) Validate(_ []string) error {
 	u16Strings := map[string]string{
 		"global-service-options":   flags.GlobalServiceOptions,
 		"protocol-characteristics": flags.ProtocolCharacterisics,
@@ -141,7 +116,7 @@ func (flags *Flags) Validate(args []string) error {
 	for name, value := range u16Strings {
 		v, err := strconv.ParseUint(value, 0, 32)
 		if err != nil {
-			return fmt.Errorf("%s: %s is not a valid 16-bit integer: %v", name, value, err)
+			return fmt.Errorf("%s: %s is not a valid 16-bit integer: %w", name, value, err)
 		}
 		if v > 0xffff {
 			return fmt.Errorf("%s: %s is larger than 16 bits", name, value)
@@ -153,11 +128,6 @@ func (flags *Flags) Validate(args []string) error {
 	return nil
 }
 
-// Help returns the module's help string.
-func (flags *Flags) Help() string {
-	return ""
-}
-
 // Init initializes the Scanner.
 func (scanner *Scanner) Init(flags zgrab2.ScanFlags) error {
 	f, _ := flags.(*Flags)
@@ -165,27 +135,14 @@ func (scanner *Scanner) Init(flags zgrab2.ScanFlags) error {
 	if f.Verbose {
 		log.SetLevel(log.DebugLevel)
 	}
+	scanner.SetBaseFlags(&f.BaseFlags)
+	scanner.DialerGroupConfig = &zgrab2.DialerGroupConfig{
+		TransportAgnosticDialerProtocol: zgrab2.TransportTCP,
+		BaseFlags:                       &f.BaseFlags,
+		TLSFlags:                        &f.TLSFlags,
+		TLSEnabled:                      f.TCPS,
+	}
 	return nil
-}
-
-// InitPerSender initializes the scanner for a given sender.
-func (scanner *Scanner) InitPerSender(senderID int) error {
-	return nil
-}
-
-// GetName returns the Scanner name defined in the Flags.
-func (scanner *Scanner) GetName() string {
-	return scanner.config.Name
-}
-
-// GetTrigger returns the Trigger defined in the Flags.
-func (scanner *Scanner) GetTrigger() string {
-	return scanner.config.Trigger
-}
-
-// Protocol returns the protocol identifier of the scan.
-func (scanner *Scanner) Protocol() string {
-	return "oracle"
 }
 
 func (scanner *Scanner) getTNSDriver() *TNSDriver {
@@ -217,32 +174,21 @@ func (scanner *Scanner) getTNSDriver() *TNSDriver {
 //     into the results, then send a Native Security Negotiation Data packet.
 //  8. If the response is not a Data packet, exit with SCAN_APPLICATION_ERROR.
 //  9. Pull the versions out of the response and exit with SCAN_SUCCESS.
-func (scanner *Scanner) Scan(t zgrab2.ScanTarget) (zgrab2.ScanStatus, interface{}, error) {
-	var results *ScanResults
+func (scanner *Scanner) Scan(ctx context.Context, dialGroup *zgrab2.DialerGroup, target *zgrab2.ScanTarget) (zgrab2.ScanStatus, any, error) {
+	results := new(ScanResults)
 
-	sock, err := t.Open(&scanner.config.BaseFlags)
+	sock, err := dialGroup.Dial(ctx, target)
 	if err != nil {
-		return zgrab2.TryGetScanStatus(err), nil, err
+		return zgrab2.TryGetScanStatus(err), nil, fmt.Errorf("could not connect to target %s: %w", target.String(), err)
 	}
-	if scanner.config.TCPS {
-		tlsConn, err := scanner.config.TLSFlags.GetTLSConnection(sock)
-		if err != nil {
-			// GetTLSConnection can only fail if the input flags are bad
-			panic(err)
-		}
-		results = new(ScanResults)
+	if tlsConn, ok := sock.(*zgrab2.TLSConnection); ok {
 		results.TLSLog = tlsConn.GetLog()
-		err = tlsConn.Handshake()
-		if err != nil {
-			return zgrab2.TryGetScanStatus(err), nil, err
-		}
-		sock = tlsConn
 	}
 
 	conn := Connection{
 		conn:      sock,
 		scanner:   scanner,
-		target:    &t,
+		target:    target,
 		tnsDriver: scanner.getTNSDriver(),
 	}
 	connectDescriptor := scanner.config.ConnectDescriptor
@@ -255,11 +201,6 @@ func (scanner *Scanner) Scan(t zgrab2.ScanTarget) (zgrab2.ScanStatus, interface{
 	handshakeLog, err := conn.Connect(connectDescriptor)
 	if handshakeLog != nil {
 		// Ensure that any handshake logs, even if incomplete, get returned.
-		if results == nil {
-			// If the results were not created previously to store the TLS log,
-			// create it now
-			results = new(ScanResults)
-		}
 		results.Handshake = handshakeLog
 	}
 

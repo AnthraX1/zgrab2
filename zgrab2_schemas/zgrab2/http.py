@@ -120,6 +120,7 @@ http_response = SubRecord(
         "status_code": Signed32BitInteger(),
         "status_line": String(),
         "headers": http_headers,
+        "headers_raw": String(),
         "body": String(),
         "body_sha256": String(),
     }
@@ -142,6 +143,9 @@ http_request_full = SubRecord(
         "trailers": http_headers,
         # The new field tls_log contains the zgrab2 TLS logs.
         "tls_log": zgrab2.tls_log,
+        "protocol": String(),
+        "protocol_major": Unsigned32BitInteger(),
+        "protocol_minor": Unsigned32BitInteger(),
     }
 )
 
@@ -151,20 +155,24 @@ http_response_full = SubRecord(
         "status_line": String(),
         "status_code": Unsigned32BitInteger(),
         # lib/http/protocol.go: http.Protocol
-        "protocol": SubRecord(
-            {
-                "name": String(),
-                "major": Unsigned32BitInteger(),
-                "minor": Unsigned32BitInteger(),
-            }
-        ),
+        "protocol": String(),
+        "protocol_major": Unsigned32BitInteger(),
+        "protocol_minor": Unsigned32BitInteger(),
         "headers": http_headers,
+        "headers_raw": String(),
         "body": String(),
         "body_sha256": Binary(),
         "content_length": Signed64BitInteger(),
         "transfer_encoding": ListOf(String()),
         "trailers": http_headers,
         "request": http_request_full,
+    }
+)
+
+redirects_to_resolved_ip = SubRecord(
+    {
+        "redirect_name": String(),
+        "ip": String(),
     }
 )
 
@@ -177,6 +185,7 @@ http_scan_response = SubRecord(
                 "connect_response": http_response,
                 "response": http_response_full,
                 "redirect_response_chain": ListOf(http_response_full),
+                "redirects_to_resolved_ips": ListOf(redirects_to_resolved_ip),
             }
         )
     },

@@ -1,0 +1,141 @@
+// Package pptp contains the zgrab2 Module implementation for PPTP.
+package pptp
+
+import (
+	"context"
+	"encoding/binary"
+	"fmt"
+	"net"
+	"time"
+
+	"github.com/zmap/zgrab2"
+)
+
+// ScanResults is the output of the scan.
+type ScanResults struct {
+	// Banner is the initial data banner sent by the server.
+	Banner string `json:"banner,omitempty"`
+
+	// ControlMessage is the received PPTP control message.
+	ControlMessage string `json:"control_message,omitempty"`
+}
+
+// Flags are the PPTP-specific command-line flags.
+type Flags struct {
+	zgrab2.BaseFlags
+}
+
+func NewModule() *zgrab2.TypedModule[Flags, Scanner, *Scanner] {
+	return zgrab2.NewTypedModule[Flags, Scanner, *Scanner]("pptp", "Point-to-Point Tunneling Protocol (PPTP)", "Scan for PPTP", 1723)
+}
+
+// Scanner implements the zgrab2.Scanner interface, and holds the state
+// for a single scan.
+type Scanner struct {
+	zgrab2.BaseScanner
+	config *Flags
+}
+
+// Init initializes the Scanner instance with the flags from the command line.
+func (scanner *Scanner) Init(flags zgrab2.ScanFlags) error {
+	f, _ := flags.(*Flags)
+	scanner.config = f
+	scanner.SetBaseFlags(&f.BaseFlags)
+	scanner.DialerGroupConfig = &zgrab2.DialerGroupConfig{
+		TransportAgnosticDialerProtocol: zgrab2.TransportTCP,
+		BaseFlags:                       &f.BaseFlags,
+	}
+	return nil
+}
+
+// PPTP Start-Control-Connection-Request message constants
+const (
+	PPTP_MAGIC_COOKIE       = 0x1A2B3C4D // PPTP Magic Cookie in bytes, see RFC 2637 section 1.4
+	PPTP_CONTROL_MESSAGE    = 1
+	PPTP_START_CONN_REQUEST = 1
+	PPTP_PROTOCOL_VERSION   = 0x0100 // Split into two 16-bit values for binary.BigEndian.PutUint16
+)
+
+// Connection holds the state for a single connection to the PPTP server.
+type Connection struct {
+	config  *Flags
+	results ScanResults
+	conn    net.Conn
+}
+
+// Create the Start-Control-Connection-Request message
+func createSCCRMessage() []byte {
+	message := make([]byte, 156)
+	binary.BigEndian.PutUint16(message[0:2], 156)                                    // Length
+	binary.BigEndian.PutUint16(message[2:4], PPTP_CONTROL_MESSAGE)                   // PPTP Message Type
+	binary.BigEndian.PutUint32(message[4:8], PPTP_MAGIC_COOKIE)                      // Magic Cookie
+	binary.BigEndian.PutUint16(message[8:10], PPTP_START_CONN_REQUEST)               // Control Message Type
+	binary.BigEndian.PutUint16(message[10:12], uint16(PPTP_PROTOCOL_VERSION>>16))    // Protocol Version (high 16 bits)
+	binary.BigEndian.PutUint16(message[12:14], uint16(PPTP_PROTOCOL_VERSION&0xFFFF)) // Protocol Version (low 16 bits)
+	binary.BigEndian.PutUint32(message[14:18], 0)                                    // Framing Capabilities
+	binary.BigEndian.PutUint32(message[18:22], 0)                                    // Bearer Capabilities
+	binary.BigEndian.PutUint16(message[22:24], 0)                                    // Maximum Channels
+	binary.BigEndian.PutUint16(message[24:26], 0)                                    // Firmware Revision
+	copy(message[26:90], "ZGRAB2-SCANNER")                                           // Host Name
+	copy(message[90:], "ZGRAB2")                                                     // Vendor Name
+	return message
+}
+
+// Read response from the PPTP server
+func (pptp *Connection) readResponse() (string, []byte, error) {
+	buffer := make([]byte, 1024)
+	if err := pptp.conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return "", nil, fmt.Errorf("could not set read deadline: %w", err)
+	}
+	n, err := pptp.conn.Read(buffer)
+	if err != nil {
+		return "", nil, fmt.Errorf("could not read response: %w", err)
+	}
+	return string(buffer[:n]), buffer[:n], nil
+}
+
+// Validate that the response contains the correct PPTP magic cookie
+func validateMagicCookie(response []byte) bool {
+	if len(response) < 8 {
+		return false
+	}
+	receivedMagicCookie := binary.BigEndian.Uint32(response[4:8])
+	return receivedMagicCookie == PPTP_MAGIC_COOKIE
+}
+
+// Scan performs the configured scan on the PPTP server
+func (scanner *Scanner) Scan(ctx context.Context, dialGroup *zgrab2.DialerGroup, target *zgrab2.ScanTarget) (zgrab2.ScanStatus, any, error) {
+	var err error
+	conn, err := dialGroup.Dial(ctx, target)
+	if err != nil {
+		return zgrab2.TryGetScanStatus(err), nil, fmt.Errorf("error opening connection to target %s: %w", target.String(), err)
+	}
+	defer zgrab2.CloseConnAndHandleError(conn)
+
+	results := ScanResults{}
+
+	pptp := Connection{conn: conn, config: scanner.config, results: results}
+
+	// Send Start-Control-Connection-Request message
+	request := createSCCRMessage()
+	_, err = pptp.conn.Write(request)
+	if err != nil {
+		return zgrab2.TryGetScanStatus(err), &pptp.results, fmt.Errorf("error sending PPTP SCCR message to target %s: %w", target.String(), err)
+	}
+
+	// Read the response
+	respStr, respBytes, err := pptp.readResponse()
+	if err != nil {
+		return zgrab2.TryGetScanStatus(err), &pptp.results, fmt.Errorf("error reading PPTP response from target %s: %w", target.String(), err)
+	}
+
+	// Store the banner and control message
+	pptp.results.Banner = string(request)
+	pptp.results.ControlMessage = respStr
+
+	if !validateMagicCookie(respBytes) {
+		return zgrab2.SCAN_PROTOCOL_ERROR, &pptp.results, fmt.Errorf("invalid PPTP magic cookie in response from target %s", target.String())
+	}
+
+	return zgrab2.SCAN_SUCCESS, &pptp.results, nil
+}

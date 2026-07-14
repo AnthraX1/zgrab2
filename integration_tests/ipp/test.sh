@@ -14,7 +14,7 @@ versions="cups cups-tls"
 function test_cups() {
     echo "ipp/test: Tests runner for ipp_cups"
 
-    CONTAINER_NAME="zgrab_ipp_cups" $ZGRAB_ROOT/docker-runner/docker-run.sh ipp --timeout 3s --verbose > "$OUTPUT_ROOT/cups.json"
+    CONTAINER_NAME="zgrab_ipp_cups" $ZGRAB_ROOT/docker-runner/docker-run.sh ipp --target-timeout 3s --verbose > "$OUTPUT_ROOT/cups.json"
     # FIXME: No good reason to use a tmp file & saved file, b/c I'm not testing any failure states yet
     #CONTAINER_NAME="zgrab_ipp_cups" $ZGRAB_ROOT/docker-runner/docker-run.sh ipp --timeout 3 --verbose > out.tmp
     major=$(jp -u data.ipp.result.version_major < "$OUTPUT_ROOT/cups.json")
@@ -29,8 +29,8 @@ function test_cups() {
         echo "ipp/test: Incorrect minor version. Expected 1, got $minor"
         exit 1
     fi
-    if ! [ $cups = "CUPS/2.1" ]; then
-        echo "ipp/test: Incorrect CUPS version. Expected CUPS/2.1, got $cups"
+    if ! [ $cups = "CUPS/2.4" ]; then
+        echo "ipp/test: Incorrect CUPS version. Expected CUPS/2.4, got $cups"
         exit 1
     fi
 }
@@ -38,7 +38,7 @@ function test_cups() {
 function test_cups_tls() {
     echo "ipp/test: Tests runner for ipp_cups-tls"
 
-    CONTAINER_NAME="zgrab_ipp_cups-tls" $ZGRAB_ROOT/docker-runner/docker-run.sh ipp --timeout 3s --ipps --verbose > "$OUTPUT_ROOT/cups-tls.json"
+    CONTAINER_NAME="zgrab_ipp_cups-tls" $ZGRAB_ROOT/docker-runner/docker-run.sh ipp --target-timeout 3s --ipps --verbose > "$OUTPUT_ROOT/cups-tls.json"
     # FIXME: No good reason to use a tmp file & saved file, b/c I'm not testing any failure states yet
     #CONTAINER_NAME="zgrab_ipp_cups-tls" $ZGRAB_ROOT/docker-runner/docker-run.sh ipp --timeout 3 --ipps --verbose > out.tmp
     major=$(jp -u data.ipp.result.version_major < "$OUTPUT_ROOT/cups-tls.json")
@@ -56,8 +56,8 @@ function test_cups_tls() {
         echo "ipp/test: Incorrect minor version. Expected 1, got $minor"
         exit 1
     fi
-    if ! [ $cups = "CUPS/2.1" ]; then
-        echo "ipp/test: Incorrect CUPS version. Expected CUPS/2.1, got $cups"
+    if ! [ $cups = "CUPS/2.4" ]; then
+        echo "ipp/test: Incorrect CUPS version. Expected CUPS/2.4, got $cups"
         exit 1
     fi
     if [ "$tls" = "null" ]; then

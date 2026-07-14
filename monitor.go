@@ -1,21 +1,28 @@
 package zgrab2
 
-import "sync"
+import (
+	"fmt"
+	"sync"
+	"time"
+
+	log "github.com/sirupsen/logrus"
+)
 
 // Monitor is a collection of states per scans and a channel to communicate
 // those scans to the monitor
 type Monitor struct {
-	states       map[string]*State
+	startTime    time.Time // time when the monitor started, for giving user elapsed time
+	states       map[string]*ModuleMetadata
 	statusesChan chan moduleStatus
 	// Callback is invoked after each scan.
 	Callback func(string)
 }
 
-// State contains the respective number of successes and failures
-// for a given scan
-type State struct {
-	Successes uint `json:"successes"`
-	Failures  uint `json:"failures"`
+// ModuleMetadata contains information of the status of a particular module's scan
+type ModuleMetadata struct {
+	Successes      uint `json:"successes"` // number of successful scans for this module
+	Failures       uint `json:"failures"`
+	CustomMetadata any  `json:"custom_metadata,omitempty"` // module-specific metadata, each module can implement this as they see fit
 }
 
 type moduleStatus struct {
@@ -32,7 +39,7 @@ const (
 
 // GetStatuses returns a mapping from scanner names to the current number
 // of successes and failures for that scanner
-func (m *Monitor) GetStatuses() map[string]*State {
+func (m *Monitor) GetStatuses() map[string]*ModuleMetadata {
 	return m.states
 }
 
@@ -43,29 +50,87 @@ func (m *Monitor) Stop() {
 	close(m.statusesChan)
 }
 
+func (m *Monitor) printStatus(isFinalPrint bool) {
+	if config.statusUpdatesFile == nil {
+		return // no file to write to
+	}
+	scanStatusMsg := ""
+	if isFinalPrint {
+		scanStatusMsg = "Scan Complete; "
+	}
+	timeSinceStart := time.Since(m.startTime)
+	scanRate := float64(0)
+	var totalSuccesses, totalFailures uint
+	for _, state := range m.states {
+		totalSuccesses += state.Successes
+		totalFailures += state.Failures
+	}
+	if timeSinceStart.Seconds() > 0 {
+		scanRate = float64(totalSuccesses+totalFailures) / timeSinceStart.Seconds() // avoid division by zero
+	}
+	scanSuccessRate := float64(0)
+	totalTargetsScanned := totalSuccesses + totalFailures
+	if totalTargetsScanned > 0 {
+		scanSuccessRate = float64(totalSuccesses) / float64(totalTargetsScanned) * 100
+	}
+	updateLine := fmt.Sprintf("%02dh:%02dm:%02ds; %s%d targets scanned; %.02f targets/sec; %.01f%% success rate",
+		int(timeSinceStart.Hours()),
+		int(timeSinceStart.Minutes())%60,
+		int(timeSinceStart.Seconds())%60,
+		scanStatusMsg,
+		totalSuccesses+totalFailures,
+		scanRate,
+		scanSuccessRate,
+	)
+	_, err := fmt.Fprintln(config.statusUpdatesFile, updateLine)
+	if err != nil {
+		log.Errorf("unable to write periodic status update: %v", err)
+	}
+}
+
 // MakeMonitor returns a Monitor object that can be used to collect and send
 // the status of a running scan
-func MakeMonitor(statusChanSize int, wg *sync.WaitGroup) *Monitor {
-	m := new(Monitor)
-	m.statusesChan = make(chan moduleStatus, statusChanSize)
-	m.states = make(map[string]*State, 10)
+func MakeMonitor(statusChanSize int, wg *sync.WaitGroup, moduleNames []string) *Monitor {
+	m := &Monitor{
+		statusesChan: make(chan moduleStatus, statusChanSize),
+		states:       make(map[string]*ModuleMetadata),
+		startTime:    time.Now(),
+	}
+	// Initialize an empty state for each module
+	for _, moduleName := range moduleNames {
+		m.states[moduleName] = &ModuleMetadata{}
+	}
 	wg.Add(1)
 	go func() {
+		ticker := time.NewTicker(time.Second)
 		defer wg.Done()
-		for s := range m.statusesChan {
-			if m.states[s.name] == nil {
-				m.states[s.name] = new(State)
-			}
-			if m.Callback != nil {
-				m.Callback(s.name)
-			}
-			switch s.st {
-			case statusSuccess:
-				m.states[s.name].Successes++
-			case statusFailure:
-				m.states[s.name].Failures++
-			default:
-				continue
+		for {
+			select {
+			case s, ok := <-m.statusesChan:
+				if !ok {
+					// channel closed, exiting
+					ticker.Stop()
+					m.printStatus(true) // print final status
+					return
+				}
+				// process new status
+				if m.states[s.name] == nil {
+					m.states[s.name] = new(ModuleMetadata)
+				}
+				if m.Callback != nil {
+					m.Callback(s.name)
+				}
+				switch s.st {
+				case statusSuccess:
+					m.states[s.name].Successes++
+				case statusFailure:
+					m.states[s.name].Failures++
+				default:
+					continue
+				}
+			case <-ticker.C:
+				// print per-second summary
+				m.printStatus(false)
 			}
 		}
 	}()

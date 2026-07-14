@@ -1,8 +1,17 @@
 package zgrab2
 
-import "time"
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"strconv"
+	"time"
 
-// Scanner is an interface that represents all functions necessary to run a scan
+	"github.com/censys/cidranger"
+)
+
+// Scanner exposes the functions for an application module to implement in order to be used by the ZGrab2 scanning framework
 type Scanner interface {
 	// Init runs once for this module at library init time
 	Init(flags ScanFlags) error
@@ -20,8 +29,244 @@ type Scanner interface {
 	// Protocol returns the protocol identifier for the scan.
 	Protocol() string
 
-	// Scan connects to a host. The result should be JSON-serializable
-	Scan(t ScanTarget) (ScanStatus, interface{}, error)
+	// Scan connects to a host. The result should be JSON-serializable. If a scan requires a dialer that isn't set in
+	// the dialer group, an error will return.
+	// ctx - The context for a scan, can be used to set timeouts or cancel scans
+	// dialerGroup - A collection of connection dialers that the module will call to establish L4 and L6 (TLS, typically)
+	//               connections before doing any protocol-specific logic.
+	// t - The target to scan, including IP or domain, port, and any tags.
+	// Returns a ScanStatus, the result (or nil) of the protocol scan (entirely protocol dependent), and any error that occurred
+	Scan(ctx context.Context, dialerGroup *DialerGroup, t *ScanTarget) (ScanStatus, any, error)
+
+	// GetDialerGroupConfig returns a DialerGroupConfig that the framework will use to set up the dialer group using the module's
+	// desired dialer configuration.
+	GetDialerGroupConfig() *DialerGroupConfig
+
+	// GetScanMetadata returns any module-specific metadata that should be included in the final output
+	// Including json struct tags is up to the module
+	// If no metadata is needed, return nil
+	GetScanMetadata() any
+}
+
+// BaseScanner provides default implementations for common Scanner methods.
+// Embed this in your Scanner struct and call SetBaseFlags(&f.BaseFlags) inside Init().
+type BaseScanner struct {
+	protocol          string
+	baseFlags         *BaseFlags
+	DialerGroupConfig *DialerGroupConfig
+}
+
+// NewBaseScanner creates a BaseScanner for the given protocol identifier.
+func NewBaseScanner(protocol string) *BaseScanner {
+	return &BaseScanner{protocol: protocol}
+}
+
+// SetBaseFlags stores the parsed BaseFlags so GetName and GetTrigger can read them.
+// Call this inside your scanner's Init() after casting the flags.
+func (s *BaseScanner) SetBaseFlags(f *BaseFlags) {
+	s.baseFlags = f
+}
+
+func (s *BaseScanner) Protocol() string                         { return s.protocol }
+func (s *BaseScanner) GetDialerGroupConfig() *DialerGroupConfig { return s.DialerGroupConfig }
+func (s *BaseScanner) GetName() string                          { return s.baseFlags.Name }
+func (s *BaseScanner) GetTrigger() string                       { return s.baseFlags.Trigger }
+func (s *BaseScanner) InitPerSender(int) error                  { return nil }
+func (s *BaseScanner) GetScanMetadata() any                     { return nil }
+func (s *BaseScanner) InitBaseScanner(protocol string)          { s.protocol = protocol }
+
+// TransportProtocol is an enum for the transport layer protocol of a module
+type TransportProtocol uint
+
+const (
+	reservedTransportProtocol TransportProtocol = iota // 0 is reserved so we can ensure the caller set this explicitly
+	TransportTCP
+	TransportUDP
+)
+
+// DialerGroupConfig lets modules communicate what they'd need in a dialer group. The framework uses this to configure
+// a default dialer group for the module.
+type DialerGroupConfig struct {
+	// TransportAgnosticDialerProtocol is the L4 transport the module uses by convention (ex: SSH over TCP).
+	// This is only used to configure the DialerGroup.TransportAgnosticDialer. The L4Dialer can handle both UDP and TCP.
+	TransportAgnosticDialerProtocol TransportProtocol
+	// NeedSeparateL4Dialer indicates whether the module needs a dedicated L4 dialer in its DialerGroup.
+	// Some modules' protocols need to send some command (STARTTLS) after L4 connection and before TLS handshake.
+	// Others like http need to follow redirects to https:// and http:// servers, which requires both a TLS and L4 (TCP) conn.
+	// Still others may require a dialer that can handle both TCP and UDP.
+	// If this is true, the framework will ensure dialerGroup.L4Dialer is set.
+	// If false, the framework will set the TransportAgnosticDialer
+	NeedSeparateL4Dialer bool
+	BaseFlags            *BaseFlags
+	// TLSEnabled indicates whether the module needs a TLS connection. The behavior depends on if NeedsL4Dialer is true.
+	// If NeedsL4Dialer is true, the framework will set up a TLSWrapper in the DialerGroup so a module can access both.
+	// If NeedsL4Dialer is false, the framework will set up a TLS dialer as the TransportAgnosticDialer since the module
+	// has indicated it only needs a TLS connection.
+	TLSEnabled bool
+	TLSFlags   *TLSFlags // must be non-nil if TLSEnabled is true
+}
+
+// Validate checks for various incompatibilities in the DialerGroupConfig
+func (config *DialerGroupConfig) Validate() error {
+	if config.BaseFlags == nil {
+		return errors.New("BaseFlags must be set")
+	}
+	switch config.TransportAgnosticDialerProtocol {
+	case TransportUDP:
+		if config.TLSEnabled {
+			// blocking this for now since it's untested. When a module is added that needs this we can unblock it and test.
+			return errors.New("TLS-over-UDP (DTLS) is not currently supported")
+		}
+	case TransportTCP, reservedTransportProtocol:
+		// nothing to validate here
+	default:
+		return fmt.Errorf("invalid TransportAgnosticDialerProtocol: %d", config.TransportAgnosticDialerProtocol)
+	}
+	if config.TLSEnabled && config.TLSFlags == nil {
+		return errors.New("TLS flags must be set if TLSEnabled is true")
+	}
+	return nil
+}
+
+func (config *DialerGroupConfig) GetDefaultDialerGroupFromConfig() (*DialerGroup, error) {
+	if err := config.Validate(); err != nil {
+		return nil, fmt.Errorf("config did not pass validation: %w", err)
+	}
+	dialerGroup := new(DialerGroup)
+	// DialerGroup has two types of dialers, the L4Dialer and the TransportAgnosticDialer.
+	// A module will use one or the other based on NeedSeparateL4Dialer
+	if config.NeedSeparateL4Dialer {
+		dialerGroup.L4Dialer = func(scanTarget *ScanTarget) func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return func(ctx context.Context, network, addr string) (net.Conn, error) {
+				switch network {
+				case "udp", "udp4", "udp6":
+					return GetDefaultUDPDialer(config.BaseFlags)(ctx, scanTarget, addr)
+				case "tcp", "tcp4", "tcp6":
+					return GetDefaultTCPDialer(config.BaseFlags)(ctx, scanTarget, addr)
+				default:
+					return nil, fmt.Errorf("unsupported network type: %s", network)
+				}
+			}
+		}
+		if config.TLSEnabled {
+			// module needs both L4 dialer and TLS wrapper
+			dialerGroup.TLSWrapper = GetDefaultTLSWrapper(config.BaseFlags, config.TLSFlags)
+		}
+	} else {
+		// module only needs a TransportAgnosticDialer
+		if config.TLSEnabled {
+			dialerGroup.TransportAgnosticDialer = func(ctx context.Context, target *ScanTarget) (net.Conn, error) {
+				// TransportAgnosticDialer only connects to a single target
+				address := net.JoinHostPort(target.Host(), strconv.Itoa(int(target.Port)))
+				return GetDefaultTLSDialer(config.BaseFlags, config.TLSFlags)(ctx, target, address)
+			}
+		} else {
+			// module only needs a TransportAgnosticDialer, so we set it based on the protocol
+			switch config.TransportAgnosticDialerProtocol {
+			case TransportUDP:
+				dialerGroup.TransportAgnosticDialer = func(ctx context.Context, target *ScanTarget) (net.Conn, error) {
+					// TransportAgnosticDialer only connects to a single target
+					address := net.JoinHostPort(target.Host(), strconv.Itoa(int(target.Port)))
+					return GetDefaultUDPDialer(config.BaseFlags)(ctx, target, address)
+				}
+			case TransportTCP:
+				dialerGroup.TransportAgnosticDialer = func(ctx context.Context, target *ScanTarget) (net.Conn, error) {
+					// TransportAgnosticDialer only connects to a single target
+					address := net.JoinHostPort(target.Host(), strconv.Itoa(int(target.Port)))
+					return GetDefaultTCPDialer(config.BaseFlags)(ctx, target, address)
+				}
+			default:
+				return nil, fmt.Errorf("unsupported TransportAgnosticDialerProtocol: %d", config.TransportAgnosticDialerProtocol)
+			}
+		}
+	}
+	return dialerGroup, nil
+}
+
+// DialerGroup wraps various dialer functions for a module to use. A module will usually only use a subset of these,
+// and will indicate which ones it needs in the DialerGroupConfig.
+type DialerGroup struct {
+	// TransportAgnosticDialer should be used by most modules that do not need control over the transport layer.
+	// It abstracts the underlying transport protocol so a module can  deal with just the L7 logic. Any protocol that
+	// doesn't need to know about the underlying transport should use this.
+	// If the transport is a TLS connection, the dialer should return a zgrab2.TLSConnection so the underlying log can be
+	// accessed.
+	TransportAgnosticDialer func(ctx context.Context, target *ScanTarget) (net.Conn, error)
+	// L4Dialer will be used by any module that needs to have a TCP/UDP connection. Think of following a redirect to an
+	// http:// server, or a module that needs to start with a TCP connection and then upgrade to TLS as part of the protocol.
+	// The layered function is needed since we set DialerGroups at Scanner.Init, but modules like HTTP will modify the
+	// Dialer based on the target, for example to use a fake DNS resolver based on the domain name.
+	L4Dialer func(target *ScanTarget) func(ctx context.Context, network, addr string) (net.Conn, error)
+	// TLSWrapper is a function that takes an existing net.Conn and upgrades it to a TLS connection. This is useful for
+	// modules that need to start with a TCP connection and then upgrade to TLS later as part of the protocol.
+	// Cannot be used for QUIC connections, as QUIC connections are not "upgraded" from a L4 connection
+	TLSWrapper func(ctx context.Context, target *ScanTarget, l4Conn net.Conn) (*TLSConnection, error)
+	Blocklist  *cidranger.Ranger // Blocklist is a list of CIDR ranges that should be blocked
+}
+
+// Dial is used to access the transport agnostic dialer
+func (d *DialerGroup) Dial(ctx context.Context, target *ScanTarget) (net.Conn, error) {
+	if d.TransportAgnosticDialer == nil {
+		return nil, errors.New("no transport agnostic dialer set")
+	}
+	return d.TransportAgnosticDialer(ctx, target)
+}
+
+// GetTLSDialer returns a function that can be used as a standalone TLS dialer. This is useful for modules like HTTP that
+// require this for handling redirects to https://
+func (d *DialerGroup) GetTLSDialer(ctx context.Context, t *ScanTarget) func(network, addr string) (*TLSConnection, error) {
+	return func(network, addr string) (*TLSConnection, error) {
+		if d.TLSWrapper == nil {
+			return nil, errors.New("no TLS wrapper set")
+		}
+		if d.L4Dialer == nil {
+			return nil, errors.New("no L4 dialer set")
+		}
+		conn, err := d.L4Dialer(t)(ctx, network, addr)
+		if err != nil {
+			return nil, fmt.Errorf("could not initiate a L4 connection with L4 dialer: %w", err)
+		}
+		return d.TLSWrapper(ctx, t, conn)
+	}
+}
+
+// DialTLSDowngrade dials a TCP connection and attempts a TLS handshake. If the
+// handshake fails and allowDowngrade is true, the poisoned connection is closed
+// and a fresh plaintext TCP connection is returned instead. Returns the
+// connection, whether TLS was successfully negotiated, and any error.
+func (d *DialerGroup) DialTLSDowngrade(ctx context.Context, target *ScanTarget, allowDowngrade bool) (net.Conn, bool, error) {
+	if d.L4Dialer == nil {
+		return nil, false, errors.New("no L4 dialer set")
+	}
+	if d.TLSWrapper == nil {
+		return nil, false, errors.New("no TLS wrapper set")
+	}
+
+	addr := net.JoinHostPort(target.Host(), strconv.Itoa(int(target.Port)))
+
+	conn, err := d.L4Dialer(target)(ctx, "tcp", addr)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to connect to %v: %w", target.String(), err)
+	}
+
+	tlsConn, tlsErr := d.TLSWrapper(ctx, target, conn)
+	if tlsErr == nil {
+		return tlsConn, true, nil
+	}
+
+	// TLS handshake failed
+	if !allowDowngrade {
+		CloseConnAndHandleError(conn)
+		return nil, false, fmt.Errorf("TLS handshake failed for %v: %w", target.String(), tlsErr)
+	}
+
+	// Handshake poisoned the connection; reconnect plaintext
+	CloseConnAndHandleError(conn)
+	conn, err = d.L4Dialer(target)(ctx, "tcp", addr)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to reconnect to %v after TLS downgrade: %w", target.String(), err)
+	}
+	return conn, false, nil
 }
 
 // ScanResponse is the result of a scan on a single host
@@ -33,66 +278,152 @@ type ScanResponse struct {
 	// the scan name.
 	Protocol string `json:"protocol"`
 
-	Result    interface{} `json:"result,omitempty"`
-	Timestamp string      `json:"timestamp,omitempty"`
-	Error     *string     `json:"error,omitempty"`
+	Port uint `json:"port"`
+
+	Result    any     `json:"result,omitempty"`
+	Timestamp string  `json:"timestamp,omitempty"`
+	Error     *string `json:"error,omitempty"`
 }
 
-// ScanModule is an interface which represents a module that the framework can
-// manipulate
-type ScanModule interface {
+// Module is the interface that every scan module must implement.
+// It combines factory methods (NewFlags, NewScanner) with the CLI registration
+// metadata (Protocol, ShortDescription, Description, DefaultPort), so both the
+// scan engine and the CLI use a single interface.
+type Module interface {
 	// NewFlags is called by the framework to pass to the argument parser. The parsed flags will be passed
 	// to the scanner created by NewScanner().
-	NewFlags() interface{}
+	NewFlags() any
 
 	// NewScanner is called by the framework for each time an individual scan is specified in the config or on
 	// the command-line. The framework will then call scanner.Init(name, flags).
 	NewScanner() Scanner
 
-	// Description returns a string suitable for use as an overview of this
-	// module within usage text.
+	// Protocol returns the protocol identifier used as the CLI subcommand name and output key.
+	Protocol() string
+
+	// ShortDescription is printed next to the module in `zgrab2 --help`.
+	ShortDescription() string
+
+	// Description returns a longer overview of the module for usage text.
 	Description() string
+
+	// DefaultPort is the well-known port for this protocol, used when the user does not specify --port.
+	DefaultPort() int
+}
+
+// BaseModule provides default implementations for the CLI-registration methods of ScanModule.
+// Embed this in your Module struct. You still need to implement NewFlags() and NewScanner().
+type BaseModule struct {
+	protocol         string
+	shortDescription string
+	description      string
+	defaultPort      int
+}
+
+// NewBaseModule creates a BaseModule with the given registration metadata.
+func NewBaseModule(protocol, shortDescription, description string, defaultPort int) *BaseModule {
+	return &BaseModule{
+		protocol:         protocol,
+		shortDescription: shortDescription,
+		description:      description,
+		defaultPort:      defaultPort,
+	}
+}
+
+func (m *BaseModule) Protocol() string         { return m.protocol }
+func (m *BaseModule) ShortDescription() string { return m.shortDescription }
+func (m *BaseModule) Description() string      { return m.description }
+func (m *BaseModule) DefaultPort() int         { return m.defaultPort }
+
+// typedScanner constrains S to be a pointer to T that satisfies Scanner and
+// can be initialized with a protocol string via the embedded BaseScanner.
+type typedScanner[T any] interface {
+	*T
+	Scanner
+	InitBaseScanner(string)
+}
+
+// TypedModule is a generic Module that auto-implements NewFlags and NewScanner
+//
+// Type parameters:
+//   - F: the Flags struct for this module (e.g. MyFlags). Must implement ScanFlags.
+//   - T: the concrete Scanner struct (e.g. MyScanner). Must embed zgrab2.BaseScanner by value.
+//   - S: the pointer to T (i.e. *MyScanner). Inferred — always pass *MyScanner as the third argument.
+//
+// Usage:
+//
+//	func NewModule() *zgrab2.TypedModule[MyFlags, MyScanner, *MyScanner] {
+//	    return zgrab2.NewTypedModule[MyFlags, MyScanner, *MyScanner]("myproto", ...)
+//	}
+type TypedModule[F ScanFlags, T any, S typedScanner[T]] struct {
+	*BaseModule
+}
+
+// NewTypedModule creates a TypedModule with the given registration metadata.
+//
+//   - protocol: the CLI subcommand name and output key (e.g. "ssh", "http"). Must be unique across all modules.
+//   - shortDescription: one-line label shown next to the module in `zgrab2 --help`.
+//   - description: full explanation of what the module does, shown in `zgrab2 <module> --help`.
+//   - defaultPort: well-known port used when the user does not pass --port.
+func NewTypedModule[F ScanFlags, T any, S typedScanner[T]](protocol, shortDescription, description string, defaultPort int) *TypedModule[F, T, S] {
+	return &TypedModule[F, T, S]{
+		BaseModule: NewBaseModule(protocol, shortDescription, description, defaultPort),
+	}
+}
+
+func (m *TypedModule[F, T, S]) NewFlags() any { return new(F) }
+func (m *TypedModule[F, T, S]) NewScanner() Scanner {
+	t := new(T)
+	s := S(t)
+	s.InitBaseScanner(m.Protocol())
+	return s
 }
 
 // ScanFlags is an interface which must be implemented by all types sent to
 // the flag parser
 type ScanFlags interface {
-	// Help optionally returns any additional help text, e.g. specifying what empty defaults
-	// are interpreted as.
+	// Help optionally returns any additional help text, e.g. specifying what empty defaults are interpreted as.
 	Help() string
-
 	// Validate enforces all command-line flags and positional arguments have valid values.
-	Validate(args []string) error
+	Validate([]string) error
 }
 
 // BaseFlags contains the options that every flags type must embed
 type BaseFlags struct {
 	Port           uint          `short:"p" long:"port" description:"Specify port to grab on"`
 	Name           string        `short:"n" long:"name" description:"Specify name for output json, only necessary if scanning multiple modules"`
-	Timeout        time.Duration `short:"t" long:"timeout" description:"Set connection timeout (0 = no timeout)" default:"10s"`
+	ConnectTimeout time.Duration `long:"connect-timeout" description:"Set max for how long to wait for initial connection establishment (0 = no timeout)" default:"10s"`
+	TargetTimeout  time.Duration `short:"t" long:"target-timeout" description:"Set max for how long a scan of a single target (IP, Domain, etc) can take (0 = no timeout)" default:"60s"`
 	Trigger        string        `short:"g" long:"trigger" description:"Invoke only on targets with specified tag"`
-	BytesReadLimit int           `short:"m" long:"maxbytes" description:"Maximum byte read limit per scan (0 = defaults)"`
-}
-
-// UDPFlags contains the common options used for all UDP scans
-type UDPFlags struct {
-	LocalPort    uint   `long:"local-port" description:"Set an explicit local port for UDP traffic"`
-	LocalAddress string `long:"local-addr" description:"Set an explicit local address for UDP traffic"`
+	Verbose        bool          `short:"v" long:"verbose" description:"More verbose logging, include debug fields in the scan results if implemented"`
 }
 
 // GetName returns the name of the respective scanner
-func (b *BaseFlags) GetName() string {
+func (b BaseFlags) GetName() string {
 	return b.Name
+}
+
+// Validate is a no-op default. Modules that need to enforce flag constraints
+// should override this method on their own Flags struct.
+func (b BaseFlags) Validate(_ []string) error {
+	return nil
+}
+
+// Help satisfies the zflags ZCommander interface so that Validate() is called
+// on all Flags structs during ini parsing. Modules with extra help text should
+// override this method on their own Flags struct.
+func (b BaseFlags) Help() string {
+	return ""
 }
 
 // GetModule returns the registered module that corresponds to the given name
 // or nil otherwise
-func GetModule(name string) ScanModule {
+func GetModule(name string) Module {
 	return modules[name]
 }
 
-var modules map[string]ScanModule
+var modules map[string]Module
 
 func init() {
-	modules = make(map[string]ScanModule)
+	modules = make(map[string]Module)
 }

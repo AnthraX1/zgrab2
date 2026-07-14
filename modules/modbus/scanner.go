@@ -20,63 +20,40 @@
 package modbus
 
 import (
+	"context"
 	"encoding/hex"
 	"fmt"
 	"net"
 
 	log "github.com/sirupsen/logrus"
+
 	"github.com/zmap/zgrab2"
 )
 
 // Flags holds the command-line configuration for the modbus scan module.
 // Populated by the framework.
 type Flags struct {
-	zgrab2.BaseFlags
-	// Protocols that support TLS should include zgrab2.TLSFlags
-	UnitID    uint8  `long:"unit-id" description:"The UnitID / Station ID to probe"`
-	ObjectID  uint8  `long:"object-id" description:"The ObjectID of the object to be read." default:"0x00"`
-	Strict    bool   `long:"strict" description:"If set, perform stricter checks on the response data to get fewer false positives"`
-	RequestID uint16 `long:"request-id" description:"Override the default request ID." default:"0x5A47"`
-	Verbose   bool   `long:"verbose" description:"More verbose logging, include debug fields in the scan results"`
+	zgrab2.BaseFlags `group:"Basic Options"` // Protocols that support TLS should include zgrab2.TLSFlags
+	UnitID           uint8                   `long:"unit-id" description:"The UnitID / Station ID to probe"`
+	ObjectID         uint8                   `long:"object-id" description:"The ObjectID of the object to be read." default:"0x00"`
+	Strict           bool                    `long:"strict" description:"If set, perform stricter checks on the response data to get fewer false positives"`
+	RequestID        uint16                  `long:"request-id" description:"Override the default request ID." default:"0x5A47"`
 }
 
-// Module implements the zgrab2.Module interface.
-type Module struct {
+func NewModule() *zgrab2.TypedModule[Flags, Scanner, *Scanner] {
+	return zgrab2.NewTypedModule[Flags, Scanner, *Scanner]("modbus", "Open-source PLC Communication Protocol (Modbus)", "Probe for Modbus devices, usually PLCs as part of a SCADA system", 502)
 }
 
 // Scanner implements the zgrab2.Scanner interface.
 type Scanner struct {
+	zgrab2.BaseScanner
 	config *Flags
-}
-
-// RegisterModule registers the zgrab2 module.
-func RegisterModule() {
-	var module Module
-	_, err := zgrab2.AddCommand("modbus", "modbus", module.Description(), 502, &module)
-	if err != nil {
-		log.Fatal(err)
-	}
-}
-
-// NewFlags returns a default Flags object.
-func (module *Module) NewFlags() interface{} {
-	return new(Flags)
-}
-
-// NewScanner returns a new Scanner instance.
-func (module *Module) NewScanner() zgrab2.Scanner {
-	return new(Scanner)
-}
-
-// Description returns an overview of this module.
-func (module *Module) Description() string {
-	return "Probe for Modbus devices, usually PLCs as part of a SCADA system"
 }
 
 // Validate checks that the flags are valid.
 // On success, returns nil.
 // On failure, returns an error instance describing the error.
-func (flags *Flags) Validate(args []string) error {
+func (flags Flags) Validate(_ []string) error {
 	if flags.Verbose {
 		// If --verbose is set, do some extra checking but don't fail.
 		if flags.ObjectID >= 0x07 && flags.ObjectID < 0x80 {
@@ -86,36 +63,16 @@ func (flags *Flags) Validate(args []string) error {
 	return nil
 }
 
-// Help returns the module's help string.
-func (flags *Flags) Help() string {
-	return ""
-}
-
 // Init initializes the Scanner.
 func (scanner *Scanner) Init(flags zgrab2.ScanFlags) error {
 	f, _ := flags.(*Flags)
 	scanner.config = f
+	scanner.SetBaseFlags(&f.BaseFlags)
+	scanner.DialerGroupConfig = &zgrab2.DialerGroupConfig{
+		TransportAgnosticDialerProtocol: zgrab2.TransportTCP,
+		BaseFlags:                       &f.BaseFlags,
+	}
 	return nil
-}
-
-// InitPerSender initializes the scanner for a given sender.
-func (scanner *Scanner) InitPerSender(senderID int) error {
-	return nil
-}
-
-// GetName returns the Scanner name defined in the Flags.
-func (scanner *Scanner) GetName() string {
-	return scanner.config.Name
-}
-
-// GetTrigger returns the Trigger defined in the Flags.
-func (scanner *Scanner) GetTrigger() string {
-	return scanner.config.Trigger
-}
-
-// Protocol returns the protocol identifier of the scan.
-func (scanner *Scanner) Protocol() string {
-	return "modbus"
 }
 
 // Conn wraps the connection state (more importantly, it provides the interface used by the old zgrab code, so that it
@@ -140,12 +97,12 @@ func (c *Conn) getUnderlyingConn() net.Conn {
 //
 // If the response is not a valid modbus response to this packet, then fail with a SCAN_PROTOCOL_ERROR.
 // Otherwise, return the parsed response and status (SCAN_SUCCESS or SCAN_APPLICATION_ERROR)
-func (scanner *Scanner) Scan(target zgrab2.ScanTarget) (zgrab2.ScanStatus, interface{}, error) {
-	conn, err := target.Open(&scanner.config.BaseFlags)
+func (scanner *Scanner) Scan(ctx context.Context, dialGroup *zgrab2.DialerGroup, target *zgrab2.ScanTarget) (zgrab2.ScanStatus, any, error) {
+	conn, err := dialGroup.Dial(ctx, target)
 	if err != nil {
-		return zgrab2.TryGetScanStatus(err), nil, err
+		return zgrab2.TryGetScanStatus(err), nil, fmt.Errorf("could not dial target %s: %w", target.String(), err)
 	}
-	defer conn.Close()
+	defer zgrab2.CloseConnAndHandleError(conn)
 
 	c := Conn{Conn: conn, scanner: scanner}
 	req := ModbusRequest{
@@ -163,8 +120,9 @@ func (scanner *Scanner) Scan(target zgrab2.ScanTarget) (zgrab2.ScanStatus, inter
 		log.Fatalf("Unexpected error marshaling modbus packet: %v", err)
 	}
 	w := 0
+	var written int
 	for w < len(data) {
-		written, err := c.getUnderlyingConn().Write(data[w:])
+		written, err = c.getUnderlyingConn().Write(data[w:])
 		w += written
 		if err != nil {
 			return zgrab2.TryGetScanStatus(err), nil, err
@@ -183,12 +141,12 @@ func (scanner *Scanner) Scan(target zgrab2.ScanTarget) (zgrab2.ScanStatus, inter
 
 	if res.Function&0x7F != ModbusFunctionEncapsulatedInterface {
 		// The server should always return a response for the same function
-		return zgrab2.SCAN_PROTOCOL_ERROR, nil, fmt.Errorf("Invalid response function code 0x%02x (raw = %s)", res.Function, hex.Dump(res.Raw))
+		return zgrab2.SCAN_PROTOCOL_ERROR, nil, fmt.Errorf("invalid response function code 0x%02x (raw = %s)", res.Function, hex.Dump(res.Raw))
 	}
 	if scanner.config.Strict && (scanner.config.UnitID != 0 && res.UnitID != int(scanner.config.UnitID)) {
 		// response for different unitID.
 		// If request unit ID was 0, don't enforce matching since that may be interpreted as a broadcast.
-		return zgrab2.SCAN_PROTOCOL_ERROR, nil, fmt.Errorf("Invalid response unit ID 0x%02x (raw = %s)", res.UnitID, hex.Dump(res.Raw))
+		return zgrab2.SCAN_PROTOCOL_ERROR, nil, fmt.Errorf("invalid response unit ID 0x%02x (raw = %s)", res.UnitID, hex.Dump(res.Raw))
 	}
 
 	if res.Length != len(res.Data)+2 {

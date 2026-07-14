@@ -3,8 +3,10 @@ package siemens
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
+	"time"
 
 	"github.com/zmap/zgrab2"
 )
@@ -22,61 +24,67 @@ const uint16Size = 2
 type ReconnectFunction func() (net.Conn, error)
 
 // GetS7Banner scans the target for S7 information, reconnecting if necessary.
-func GetS7Banner(logStruct *S7Log, connection net.Conn, reconnect ReconnectFunction) (err error) {
+func GetS7Banner(logStruct *S7Log, connection net.Conn, reconnect ReconnectFunction, readTimeout time.Duration) error {
 	// Attempt connection
 	var connPacketBytes, connResponseBytes []byte
-	connPacketBytes, err = makeCOTPConnectionPacketBytes(uint16(0x102), uint16(0x100))
+	connPacketBytes, err := makeCOTPConnectionPacketBytes(uint16(0x102), uint16(0x100))
 	if err != nil {
-		return err
+		return fmt.Errorf("could not make COTP connection packet bytes: %w", err)
 	}
-	connResponseBytes, err = sendRequestReadResponse(connection, connPacketBytes)
-	if connResponseBytes == nil || len(connResponseBytes) == 0 || err != nil {
-		connection.Close()
+	connResponseBytes, err = sendRequestReadResponse(connection, connPacketBytes, readTimeout)
+	if len(connResponseBytes) == 0 || err != nil {
+		zgrab2.CloseConnAndHandleError(connection)
 		connection, err = reconnect()
 		if err != nil {
-			return err
+			return fmt.Errorf("could not re-establish connection: %w", err)
 		}
 
 		connPacketBytes, err = makeCOTPConnectionPacketBytes(uint16(0x200), uint16(0x100))
 		if err != nil {
-			return err
+			return fmt.Errorf("could not make COTP connection packet bytes: %w", err)
 		}
-		connResponseBytes, err = sendRequestReadResponse(connection, connPacketBytes)
+		connResponseBytes, err = sendRequestReadResponse(connection, connPacketBytes, readTimeout)
 		if err != nil {
-			return err
+			return fmt.Errorf("could not send request and read response: %w", err)
 		}
 	}
 
 	_, err = unmarshalCOTPConnectionResponse(connResponseBytes)
 	if err != nil {
-		return err
+		return fmt.Errorf("could not unmarshal COTP connection response: %w", err)
 	}
 
 	// Negotiate S7
 	requestPacketBytes, err := makeRequestPacketBytes(S7_REQUEST, makeNegotiatePDUParamBytes(), nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("could not make request packet bytes: %w", err)
 	}
-	_, err = sendRequestReadResponse(connection, requestPacketBytes)
+	_, err = sendRequestReadResponse(connection, requestPacketBytes, readTimeout)
 	if err != nil {
-		return err
+		return fmt.Errorf("could not send s7 request and read response: %w", err)
 	}
 
 	logStruct.IsS7 = true
 
 	// Make Module Identification request
-	moduleIdentificationResponse, err := readRequest(connection, S7_SZL_MODULE_IDENTIFICATION)
+	moduleIdentificationResponse, err := readRequest(connection, S7_SZL_MODULE_IDENTIFICATION, readTimeout)
 	if err != nil {
-		return err
+		return fmt.Errorf("could not read module identification response: %w", err)
 	}
-	parseModuleIdentificationRequest(logStruct, &moduleIdentificationResponse)
+	err = parseModuleIdentificationRequest(logStruct, &moduleIdentificationResponse)
+	if err != nil {
+		return fmt.Errorf("failed to parse module identification response: %w", err)
+	}
 
 	// Make Component Identification request
-	componentIdentificationResponse, err := readRequest(connection, S7_SZL_COMPONENT_IDENTIFICATION)
+	componentIdentificationResponse, err := readRequest(connection, S7_SZL_COMPONENT_IDENTIFICATION, readTimeout)
 	if err != nil {
-		return err
+		return fmt.Errorf("could not read component identification response: %w", err)
 	}
-	parseComponentIdentificationResponse(logStruct, &componentIdentificationResponse)
+	err = parseComponentIdentificationResponse(logStruct, &componentIdentificationResponse)
+	if err != nil {
+		return fmt.Errorf("failed to parse component identification response: %w", err)
+	}
 
 	return nil
 }
@@ -132,9 +140,11 @@ func makeRequestPacketBytes(pduType byte, parameters []byte, data []byte) ([]byt
 }
 
 // Send a generic packet request and return the response
-func sendRequestReadResponse(connection net.Conn, requestBytes []byte) ([]byte, error) {
-	connection.Write(requestBytes)
-	responseBytes, err := zgrab2.ReadAvailable(connection)
+func sendRequestReadResponse(connection net.Conn, requestBytes []byte, readTimeout time.Duration) ([]byte, error) {
+	if n, err := connection.Write(requestBytes); err != nil {
+		return nil, fmt.Errorf("error encountered after writing %d bytes: %w", n, err)
+	}
+	responseBytes, err := zgrab2.ReadAvailableWithOptions(connection, len(requestBytes), readTimeout, 0, 4096)
 	if err != nil {
 		return nil, err
 	}
@@ -281,7 +291,7 @@ type moduleIDData struct {
 // parseModuleIDDataRecord parses a byte slice into a DataRecord.
 func parseModuleIDDataRecord(data []byte) (*moduleIDData, error) {
 	if len(data) < 28 {
-		return nil, fmt.Errorf("data slice too short to contain a valid DataRecord")
+		return nil, errors.New("data slice too short to contain a valid DataRecord")
 	}
 
 	return &moduleIDData{
@@ -322,14 +332,14 @@ func parseModuleIdentificationRequest(logStruct *S7Log, s7Packet *S7Packet) erro
 
 	// Check if the data record length and number of data records are valid
 	if recordLen != s7ModuleIdRecordSize || numRecords*recordLen > len(s7Packet.Data)-offset {
-		return fmt.Errorf("invalid data record length or number of data records")
+		return errors.New("invalid data record length or number of data records")
 	}
 
 	// Now parse the data records, considering each one is 28 bytes long after the header
 	for i := 0; i < int(numRecords); i++ {
 		record, err := parseModuleIDDataRecord(s7Packet.Data[offset : offset+recordLen])
 		if err != nil {
-			return fmt.Errorf("failed parsing data record %d: %v", i, err)
+			return fmt.Errorf("failed parsing data record %d: %w", i, err)
 		}
 
 		switch record.Index {
@@ -347,12 +357,12 @@ func parseModuleIdentificationRequest(logStruct *S7Log, s7Packet *S7Packet) erro
 	return nil
 }
 
-func readRequest(connection net.Conn, slzId uint16) (packet S7Packet, err error) {
+func readRequest(connection net.Conn, slzId uint16, readTimeout time.Duration) (packet S7Packet, err error) {
 	readRequestBytes, err := makeReadRequestBytes(slzId)
 	if err != nil {
 		return packet, err
 	}
-	readResponse, err := sendRequestReadResponse(connection, readRequestBytes)
+	readResponse, err := sendRequestReadResponse(connection, readRequestBytes, readTimeout)
 	if err != nil {
 		return packet, err
 	}

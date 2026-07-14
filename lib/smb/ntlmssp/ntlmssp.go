@@ -141,6 +141,10 @@ type AvPair struct {
 	AvLen uint16 `smb:"len:Value"`
 	Value []byte
 }
+
+func (p AvPair) GetAvID() uint16  { return p.AvID }
+func (p AvPair) GetValue() []byte { return p.Value }
+
 type AvPairSlice []AvPair
 
 func (p AvPair) Size() uint64 {
@@ -179,7 +183,7 @@ func (s *AvPairSlice) UnmarshalBinary(buf []byte, meta *encoder.Metadata) error 
 			offset, length)
 	}
 	if offset+length > int64(len(meta.ParentBuf)) {
-		return fmt.Errorf("AvPairSlice.UnmarshalBinary: ParentBuf overrun")
+		return errors.New("AvPairSlice.UnmarshalBinary: ParentBuf overrun")
 	}
 	for i := length; i > 0; {
 		var avPair AvPair
@@ -285,10 +289,9 @@ func newAuthenticate(domain, user, workstation string, nthash, lmhash []byte, c 
 
 	clientChallenge := make([]byte, 8)
 	rand.Reader.Read(clientChallenge)
-	serverChallenge := make([]byte, 8)
 	w := bytes.NewBuffer(make([]byte, 0))
 	binary.Write(w, binary.LittleEndian, c.ServerChallenge)
-	serverChallenge = w.Bytes()
+	serverChallenge := w.Bytes()
 	w = bytes.NewBuffer(make([]byte, 0))
 	for _, av := range *c.TargetInfo {
 		binary.Write(w, binary.LittleEndian, av.AvID)

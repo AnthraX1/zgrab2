@@ -12,9 +12,15 @@
 package mssql
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"strconv"
 	"strings"
 
 	log "github.com/sirupsen/logrus"
+
 	"github.com/zmap/zgrab2"
 )
 
@@ -43,45 +49,20 @@ type ScanResults struct {
 
 // Flags defines the command-line configuration options for the module.
 type Flags struct {
-	zgrab2.BaseFlags
-	zgrab2.TLSFlags
-	EncryptMode string `long:"encrypt-mode" description:"The type of encryption to request in the pre-login step. One of ENCRYPT_ON, ENCRYPT_OFF, ENCRYPT_NOT_SUP." default:"ENCRYPT_ON"`
-	Verbose     bool   `long:"verbose" description:"More verbose logging, include debug fields in the scan results"`
+	zgrab2.BaseFlags `group:"Basic Options"`
+	zgrab2.TLSFlags  `group:"TLS Options"`
+	EncryptMode      string `long:"encrypt-mode" description:"The type of encryption to request in the pre-login step. One of ENCRYPT_ON, ENCRYPT_OFF, ENCRYPT_NOT_SUP." default:"ENCRYPT_ON"`
 }
 
 // Module is the implementation of zgrab2.Module for the MSSQL protocol.
-type Module struct {
+func NewModule() *zgrab2.TypedModule[Flags, Scanner, *Scanner] {
+	return zgrab2.NewTypedModule[Flags, Scanner, *Scanner]("mssql", "Microsoft SQL Server (MSSQL)", "Perform a handshake for MSSQL databases", 1433)
 }
 
 // Scanner is the implementation of zgrab2.Scanner for the MSSQL protocol.
 type Scanner struct {
+	zgrab2.BaseScanner
 	config *Flags
-}
-
-// NewFlags returns a default Flags instance to be populated by the command
-// line flags.
-func (module *Module) NewFlags() interface{} {
-	return new(Flags)
-}
-
-// NewScanner returns a new Scanner instance.
-func (module *Module) NewScanner() zgrab2.Scanner {
-	return new(Scanner)
-}
-
-// Description returns an overview of this module.
-func (module *Module) Description() string {
-	return "Perform a handshake for MSSQL databases"
-}
-
-// Validate does nothing in this module.
-func (flags *Flags) Validate(args []string) error {
-	return nil
-}
-
-// Help returns the help string for this module.
-func (flags *Flags) Help() string {
-	return ""
 }
 
 // Init initializes the Scanner instance with the given command-line flags.
@@ -91,27 +72,15 @@ func (scanner *Scanner) Init(flags zgrab2.ScanFlags) error {
 	if f.Verbose {
 		log.SetLevel(log.DebugLevel)
 	}
+	scanner.SetBaseFlags(&f.BaseFlags)
+	scanner.DialerGroupConfig = &zgrab2.DialerGroupConfig{
+		TransportAgnosticDialerProtocol: zgrab2.TransportTCP,
+		NeedSeparateL4Dialer:            true,
+		BaseFlags:                       &f.BaseFlags,
+		TLSEnabled:                      true,
+		TLSFlags:                        &f.TLSFlags,
+	}
 	return nil
-}
-
-// InitPerSender does nothing in this module.
-func (scanner *Scanner) InitPerSender(senderID int) error {
-	return nil
-}
-
-// Protocol returns the protocol identifer for the scanner.
-func (s *Scanner) Protocol() string {
-	return "mssql"
-}
-
-// GetName returns the configured scanner name.
-func (scanner *Scanner) GetName() string {
-	return scanner.config.Name
-}
-
-// GetTrigger returns the Trigger defined in the Flags.
-func (scanner *Scanner) GetTrigger() string {
-	return scanner.config.Trigger
 }
 
 // Scan performs the MSSQL scan.
@@ -121,16 +90,25 @@ func (scanner *Scanner) GetTrigger() string {
 // 4. If the server encrypt mode is EncryptModeNotSupported, break.
 // 5. Perform a TLS handshake, with the packets wrapped in TDS headers.
 // 6. Decode the Version and InstanceName from the PRELOGIN response
-func (scanner *Scanner) Scan(target zgrab2.ScanTarget) (zgrab2.ScanStatus, interface{}, error) {
-	conn, err := target.Open(&scanner.config.BaseFlags)
+func (scanner *Scanner) Scan(ctx context.Context, dialGroup *zgrab2.DialerGroup, target *zgrab2.ScanTarget) (zgrab2.ScanStatus, any, error) {
+	l4Dialer := dialGroup.L4Dialer
+	if l4Dialer == nil {
+		return zgrab2.SCAN_INVALID_INPUTS, nil, errors.New("l4 dialer is required for mssql")
+	}
+	conn, err := l4Dialer(target)(ctx, "tcp", net.JoinHostPort(target.Host(), strconv.Itoa(int(target.Port))))
 	if err != nil {
-		return zgrab2.TryGetScanStatus(err), nil, err
+		return zgrab2.TryGetScanStatus(err), nil, fmt.Errorf("error dialing target %s: %w", target.String(), err)
 	}
 	sql := NewConnection(conn)
-	defer sql.Close()
+	defer func(sql *Connection) {
+		err = sql.Close()
+		if err != nil {
+			log.Errorf("error closing connection to target %s: %v", target.String(), err)
+		}
+	}(sql)
 	result := &ScanResults{}
 
-	encryptMode, handshakeErr := sql.Handshake(scanner.config)
+	encryptMode, handshakeErr := sql.Handshake(ctx, target, scanner.config.EncryptMode, dialGroup.TLSWrapper)
 
 	result.EncryptMode = &encryptMode
 
@@ -154,7 +132,7 @@ func (scanner *Scanner) Scan(target zgrab2.ScanTarget) (zgrab2.ScanStatus, inter
 	}
 
 	if handshakeErr != nil {
-		if sql.PreloginOptions == nil && sql.readValidTDSPacket == false {
+		if sql.PreloginOptions == nil && !sql.readValidTDSPacket {
 			// If we received no PreloginOptions and none of the packets we've
 			// read appeared to be a valid TDS header, then the inference is
 			// that we found no MSSQL service on the target.
@@ -163,23 +141,14 @@ func (scanner *Scanner) Scan(target zgrab2.ScanTarget) (zgrab2.ScanStatus, inter
 			// nil.
 			result = nil
 		}
-		switch handshakeErr {
-		case ErrNoServerEncryption:
+		switch {
+		case errors.Is(handshakeErr, ErrNoServerEncryption):
 			return zgrab2.SCAN_APPLICATION_ERROR, result, handshakeErr
-		case ErrServerRequiresEncryption:
+		case errors.Is(handshakeErr, ErrServerRequiresEncryption):
 			return zgrab2.SCAN_APPLICATION_ERROR, result, handshakeErr
 		default:
 			return zgrab2.TryGetScanStatus(handshakeErr), result, handshakeErr
 		}
 	}
 	return zgrab2.SCAN_SUCCESS, result, nil
-}
-
-// RegisterModule is called by modules/mssql.go's init()
-func RegisterModule() {
-	var module Module
-	_, err := zgrab2.AddCommand("mssql", "MSSQL", module.Description(), 1433, &module)
-	if err != nil {
-		log.Fatal(err)
-	}
 }

@@ -11,6 +11,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/csv"
 	"encoding/hex"
 	"errors"
@@ -21,22 +22,30 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	"github.com/zmap/zcrypto/tls"
 
 	log "github.com/sirupsen/logrus"
-	"github.com/zmap/zcrypto/tls"
+	"golang.org/x/net/html/charset"
+
 	"github.com/zmap/zgrab2"
 	"github.com/zmap/zgrab2/lib/http"
-	"golang.org/x/net/html/charset"
+	"github.com/zmap/zgrab2/lib/http2"
 )
 
 var (
-	// ErrRedirLocalhost is returned when an HTTP redirect points to localhost,
-	// unless FollowLocalhostRedirects is set.
-	ErrRedirLocalhost = errors.New("Redirecting to localhost")
-
 	// ErrTooManyRedirects is returned when the number of HTTP redirects exceeds
 	// MaxRedirects.
-	ErrTooManyRedirects = errors.New("Too many redirects")
+	ErrTooManyRedirects = errors.New("too many redirects")
+	ErrDoNotRedirect    = errors.New("no redirects configured")
+
+	// ErrHTTPSProtocolMismatch is returned by Grab() when --fail-http-to-https is
+	// set and the server's response shows it is an HTTPS server that received a
+	// plaintext HTTP request (Apache/NGINX HTTP/400 protocol-mismatch responses).
+	// It is a sentinel so Scan() can distinguish this specific, retry-worthy
+	// failure from every other SCAN_PROTOCOL_ERROR.
+	ErrHTTPSProtocolMismatch = errors.New("NGINX or Apache HTTP over HTTPS failure")
 )
 
 // Flags holds the command-line configuration for the HTTP scan module.
@@ -44,20 +53,16 @@ var (
 //
 // TODO: Custom headers?
 type Flags struct {
-	zgrab2.BaseFlags
-	zgrab2.TLSFlags
-	Method          string `long:"method" default:"GET" description:"Set HTTP request method type"`
-	Endpoint        string `long:"endpoint" default:"/" description:"Send an HTTP request to an endpoint"`
-	FailHTTPToHTTPS bool   `long:"fail-http-to-https" description:"Trigger retry-https logic on known HTTP/400 protocol mismatch responses"`
-	UserAgent       string `long:"user-agent" default:"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:129.0) Gecko/20100101 Firefox/129.0" description:"Set a custom user agent"`
-	RetryHTTPS      bool   `long:"retry-https" description:"If the initial request fails, reconnect and try with HTTPS."`
-	MaxSize         int    `long:"max-size" default:"256" description:"Max kilobytes to read in response to an HTTP request"`
-	MaxRedirects    int    `long:"max-redirects" default:"0" description:"Max number of redirects to follow"`
+	zgrab2.BaseFlags `group:"Basic Options"`
+	zgrab2.TLSFlags  `group:"TLS Options"`
+	Method           string `long:"method" default:"GET" description:"Set HTTP request method type"`
+	Endpoint         string `long:"endpoint" default:"/" description:"Send an HTTP request to an endpoint"`
+	FailHTTPToHTTPS  bool   `long:"fail-http-to-https" description:"Trigger retry-https logic on known HTTP/400 protocol mismatch responses"`
+	UserAgent        string `long:"user-agent" default:"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:129.0) Gecko/20100101 Firefox/129.0" description:"Set a custom user agent"`
+	RetryHTTPS       bool   `long:"retry-https" description:"If the initial request fails, reconnect and try with HTTPS."`
+	MaxSize          int    `long:"max-size" default:"256" description:"Max kilobytes to read in response to an HTTP request"`
+	MaxRedirects     int    `long:"max-redirects" default:"0" description:"Max number of redirects to follow"`
 	MaxTries        int    `long:"max-tries" default:"1" description:"Number of tries for timeouts and connection errors before giving up."`
-
-	// FollowLocalhostRedirects overrides the default behavior to return
-	// ErrRedirLocalhost whenever a redirect points to localhost.
-	FollowLocalhostRedirects bool `long:"follow-localhost-redirects" description:"Follow HTTP redirects to localhost"`
 
 	// UseHTTPS causes the first request to be over TLS, without requiring a
 	// redirect to HTTPS. It does not change the port used for the connection.
@@ -73,18 +78,20 @@ type Flags struct {
 	// Set HTTP Request body
 	RequestBody    string `long:"request-body" description:"HTTP request body to send to server"`
 	RequestBodyHex string `long:"request-body-hex" description:"HTTP request body to send to server"`
-
-	OverrideSH bool `long:"override-sig-hash" description:"Override the default SignatureAndHashes TLS option with more expansive default"`
+	SkipHost       bool   `long:"skip-host" description:"Skip encoding the Host header"`
 
 	// ComputeDecodedBodyHashAlgorithm enables computing the body hash later than the default,
 	// using the specified algorithm, allowing a user of the response to recompute a matching hash
-	ComputeDecodedBodyHashAlgorithm string `long:"compute-decoded-body-hash-algorithm" choice:"sha256" choice:"sha1" description:"Choose algorithm for BodyHash field"`
+	ComputeDecodedBodyHashAlgorithm string `long:"compute-decoded-body-hash-algorithm" choice:"sha256,sha1" description:"Choose algorithm for BodyHash field"`
 
 	// WithBodyLength enables adding the body_size field to the Response
-	WithBodyLength bool `long:"with-body-size" description:"Enable the body_size attribute, for how many bytes actually read"`
+	WithBodyLength bool `long:"with-body-size" description:"inserts the body_size field into the http result, listing how many bytes were read of the body"`
 
 	// Extract the raw header as it is on the wire
 	RawHeaders bool `long:"raw-headers" description:"Extract raw response up through headers"`
+
+	NoHTTP11 bool `long:"no-http1.1" description:"Use HTTP/2 with the initial request. If this connection is over TLS, we'll advertise HTTP/2 in ALPN. If not over TLS, we'll send an HTTP/2 over clear-text (h2c) request, sometimes known as http2 prior knowledge. Setting TLS.NextProtos will take precedence over this flag. Mutually exclusive with --no-http2"`
+	NoHTTP2  bool `long:"no-http2" description:"Use HTTP/1.1 with the initial request. If this connection is over TLS, we'll advertise HTTP/1.1 in ALPN. If not over TLS, we'll use a plain-text HTTP/1.1 request. Setting TLS.NextProtos will take precedence over this flag. Mutually exclusive with --no-http1.1"`
 }
 
 // A Results object is returned by the HTTP module's Scanner.Scan()
@@ -96,61 +103,63 @@ type Results struct {
 	// RedirectResponseChain is non-empty is the scanner follows a redirect.
 	// It contains all redirect response prior to the final response.
 	RedirectResponseChain []*http.Response `json:"redirect_response_chain,omitempty"`
+	NamesToIPs            []RedirectToIP   `json:"redirects_to_resolved_ips,omitempty"`
+}
+
+type RedirectToIP struct {
+	RedirectName string `json:"redirect_name"`
+	IP           string `json:"ip"`
 }
 
 // Module is an implementation of the zgrab2.Module interface.
-type Module struct {
+func NewModule() *zgrab2.TypedModule[Flags, Scanner, *Scanner] {
+	return zgrab2.NewTypedModule[Flags, Scanner, *Scanner]("http", "Hypertext Transfer Protocol (HTTP)", strings.Join([]string{
+		"Send an HTTP request and read the response, optionally following redirects. ",
+		"Ex: echo \"en.wikipedia.org\" | ./zgrab2 http --max-redirects=1 --endpoint=\"/wiki/New_York_City\"",
+	}, "\n"), 0)
 }
 
 // Scanner is the implementation of the zgrab2.Scanner interface.
 type Scanner struct {
+	zgrab2.BaseScanner
 	config        *Flags
 	customHeaders map[string]string
-	requestBody   string
 	decodedHashFn func([]byte) string
 }
 
 // scan holds the state for a single scan. This may entail multiple connections.
 // It is used to implement the zgrab2.Scanner interface.
 type scan struct {
-	connections    []net.Conn
-	scanner        *Scanner
-	target         *zgrab2.ScanTarget
-	transport      *http.Transport
-	client         *http.Client
-	results        Results
-	url            string
-	globalDeadline time.Time
-}
-
-// NewFlags returns an empty Flags object.
-func (module *Module) NewFlags() interface{} {
-	return new(Flags)
-}
-
-// NewScanner returns a new instance Scanner instance.
-func (module *Module) NewScanner() zgrab2.Scanner {
-	return new(Scanner)
-}
-
-// Description returns an overview of this module.
-func (module *Module) Description() string {
-	return "Send an HTTP request and read the response, optionally following redirects."
+	connections            []net.Conn
+	cancelFuncs            []context.CancelFunc
+	scanner                *Scanner
+	target                 *zgrab2.ScanTarget
+	client                 *http.Client
+	results                Results
+	url                    string
+	globalDeadline         time.Time
+	redirectsToResolvedIPs map[string]string // appended the result of DNS resolution for each
 }
 
 // Validate performs any needed validation on the arguments
-func (flags *Flags) Validate(args []string) error {
+func (flags Flags) Validate(_ []string) error {
+	if flags.NoHTTP2 && flags.NoHTTP11 {
+		return errors.New("cannot use both --no-http2 and --no-http1.1. Pick one or neither depending on which version you want to use")
+	}
 	return nil
 }
 
 // Help returns module-specific help
-func (flags *Flags) Help() string {
-	return ""
-}
-
-// Protocol returns the protocol identifer for the scanner.
-func (scanner *Scanner) Protocol() string {
-	return "http"
+func (flags Flags) Help() string {
+	lines := []string{"By default, the HTTP module will send a plain-text HTTP/1.1 GET request to the target's root path (/).",
+		"HTTP Versions and TLS - HTTP version affects two things: the protocol used in the request and the supported versions advertised in the TLS ALPN header (if TLS is used).",
+		" - Plain-text HTTP/1.1 (default)               zgrab2 http",
+		" - Advertise both HTTP/2 and HTTP/1.1 in ALPN  --use-https - This is the default behavior of most web browsers",
+		" - HTTP/2-only over plain-text                 --no-http1.1 - Sends the HTTP/2 connection preface over plain-text TCP, like curl's --http2-prior-knowledge flag",
+		" - HTTP/1.1-only over TLS                      --no-http2 --use-https - Will only advertise http/1.1 support in ALPN header",
+		" - HTTP/2-only over TLS                        --no-http1.1 --use-https - Use --use-https to connect with TLS instead. Using --use-https --no-http1.1 will only advertise HTTP/2 support ",
+	}
+	return strings.Join(lines, "\n")
 }
 
 // Init initializes the scanner with the given flags
@@ -158,6 +167,15 @@ func (scanner *Scanner) Init(flags zgrab2.ScanFlags) error {
 	fl, _ := flags.(*Flags)
 	scanner.config = fl
 	scanner.config.RequestBody = fl.RequestBody
+
+	// Configure default port if unset
+	if fl.Port == 0 {
+		if fl.UseHTTPS {
+			fl.Port = 443
+		} else {
+			fl.Port = 80
+		}
+	}
 
 	// parse out custom headers at initialization so that they can be easily
 	// iterated over when constructing individual scanners
@@ -201,12 +219,12 @@ func (scanner *Scanner) Init(flags zgrab2.ScanFlags) error {
 			// The case of header names is normalized to title case later by HTTP library
 			// explicitly ToLower() to catch duplicates more easily
 			hName := strings.ToLower(headerNames[i])
-			switch {
-			case hName == "host":
+			switch hName {
+			case "host":
 				log.Panicf("Attempt to set immutable header 'Host', specify this in targets file")
-			case hName == "user-agent":
+			case "user-agent":
 				log.Panicf("Attempt to set special header 'User-Agent', use --user-agent instead")
-			case hName == "content-length":
+			case "content-length":
 				log.Panicf("Attempt to set immutable header 'Content-Length'")
 			}
 			// Disallow duplicate headers
@@ -221,33 +239,31 @@ func (scanner *Scanner) Init(flags zgrab2.ScanFlags) error {
 	if fl.ComputeDecodedBodyHashAlgorithm == "sha1" {
 		scanner.decodedHashFn = func(body []byte) string {
 			rawHash := sha1.Sum(body)
-			return fmt.Sprintf("sha1:%s", hex.EncodeToString(rawHash[:]))
+			return "sha1:" + hex.EncodeToString(rawHash[:])
 		}
 	} else if fl.ComputeDecodedBodyHashAlgorithm == "sha256" {
 		scanner.decodedHashFn = func(body []byte) string {
 			rawHash := sha256.Sum256(body)
-			return fmt.Sprintf("sha256:%s", hex.EncodeToString(rawHash[:]))
+			return "sha256:" + hex.EncodeToString(rawHash[:])
 		}
 	} else if fl.ComputeDecodedBodyHashAlgorithm != "" {
 		log.Panicf("Invalid ComputeDecodedBodyHashAlgorithm choice made it through zflags: %s", scanner.config.ComputeDecodedBodyHashAlgorithm)
 	}
 
+	scanner.SetBaseFlags(&scanner.config.BaseFlags)
+	scanner.DialerGroupConfig = &zgrab2.DialerGroupConfig{
+		TransportAgnosticDialerProtocol: zgrab2.TransportTCP,
+		NeedSeparateL4Dialer:            true,
+		BaseFlags:                       &scanner.config.BaseFlags,
+		TLSEnabled:                      true,
+		TLSFlags:                        &scanner.config.TLSFlags,
+	}
+
+	// The http2 library logs a lot of stuff with pretty unhelpful messages when scanning large numbers of hosts
+	// Could later be made configurable to different log levels, but we'd need to add some sort of disambiguation info, like the target host the log message is about
+	http2.SetLogger(io.Discard)
+
 	return nil
-}
-
-// InitPerSender does nothing in this module.
-func (scanner *Scanner) InitPerSender(senderID int) error {
-	return nil
-}
-
-// GetName returns the name defined in the Flags.
-func (scanner *Scanner) GetName() string {
-	return scanner.config.Name
-}
-
-// GetTrigger returns the Trigger defined in the Flags.
-func (scanner *Scanner) GetTrigger() string {
-	return scanner.config.Trigger
 }
 
 // Cleanup closes any connections that have been opened during the scan
@@ -258,140 +274,41 @@ func (scan *scan) Cleanup() {
 		}
 		scan.connections = nil
 	}
+	if scan.cancelFuncs != nil {
+		for _, cancel := range scan.cancelFuncs {
+			cancel()
+		}
+		scan.cancelFuncs = nil
+	}
 }
 
 // Get a context whose deadline is the earliest of the context's deadline (if it has one) and the
 // global scan deadline.
-func (scan *scan) withDeadlineContext(ctx context.Context) context.Context {
+func (scan *scan) withDeadlineContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if scan.globalDeadline.IsZero() {
+		return ctx, func() {}
+	}
 	ctxDeadline, ok := ctx.Deadline()
 	if !ok || scan.globalDeadline.Before(ctxDeadline) {
-		ret, _ := context.WithDeadline(ctx, scan.globalDeadline)
-		return ret
+		ret, cancelFunc := context.WithDeadline(ctx, scan.globalDeadline)
+		return ret, cancelFunc
 	}
-	return ctx
-}
-
-// Dial a connection using the configured timeouts, as well as the global deadline, and on success,
-// add the connection to the list of connections to be cleaned up.
-func (scan *scan) dialContext(ctx context.Context, network string, addr string) (net.Conn, error) {
-	dialer := zgrab2.GetTimeoutConnectionDialer(scan.scanner.config.Timeout)
-
-	switch network {
-	case "tcp", "tcp4", "tcp6", "udp", "udp4", "udp6":
-		// If the scan is for a specific IP, and a domain name is provided, we
-		// don't want to just let the http library resolve the domain.  Create
-		// a fake resolver that we will use, that always returns the IP we are
-		// given to scan.
-		if scan.target.IP != nil && scan.target.Domain != "" {
-			host, _, err := net.SplitHostPort(addr)
-			if err != nil {
-				log.Errorf("http/scanner.go dialContext: unable to split host:port '%s'", addr)
-				log.Errorf("No fake resolver, IP address may be incorrect: %s", err)
-			} else {
-				// In the case of redirects, we don't want to blindly use the
-				// IP we were given to scan, however.  Only use the fake
-				// resolver if the domain originally specified for the scan
-				// target matches the current address being looked up in this
-				// DialContext.
-				if host == scan.target.Domain {
-					resolver, err := zgrab2.NewFakeResolver(scan.target.IP.String())
-					if err != nil {
-						return nil, err
-					}
-					dialer.Dialer.Resolver = resolver
-				}
-			}
-		}
-	}
-
-	timeoutContext, _ := context.WithTimeout(context.Background(), scan.scanner.config.Timeout)
-
-	conn, err := dialer.DialContext(scan.withDeadlineContext(timeoutContext), network, addr)
-	if err != nil {
-		return nil, err
-	}
-	scan.connections = append(scan.connections, conn)
-	return conn, nil
-}
-
-// getTLSDialer returns a Dial function that connects using the
-// zgrab2.GetTLSConnection()
-func (scan *scan) getTLSDialer(t *zgrab2.ScanTarget) func(network, addr string) (net.Conn, error) {
-	return func(network, addr string) (net.Conn, error) {
-		outer, err := scan.dialContext(context.Background(), network, addr)
-		if err != nil {
-			return nil, err
-		}
-		cfg, err := scan.scanner.config.TLSFlags.GetTLSConfigForTarget(t)
-		if err != nil {
-			return nil, err
-		}
-
-		// Set SNI server name on redirects unless --server-name was used (issue #300)
-		//  - t.Domain is always set to the *original* Host so it's not useful for setting SNI
-		//  - host is the current target of the request in this context; this is true for the
-		//    initial request as well as subsequent requests caused by redirects
-		//  - scan.scanner.config.ServerName is the value from --server-name if one was specified
-
-		// If SNI is enabled and --server-name is not set, use the target host for the SNI server name
-		if !scan.scanner.config.NoSNI && scan.scanner.config.ServerName == "" {
-			host, _, err := net.SplitHostPort(addr)
-			if err != nil {
-				log.Errorf("getTLSDialer(): Something went wrong splitting host/port '%s': %s", addr, err)
-			}
-			// RFC4366: Literal IPv4 and IPv6 addresses are not permitted in "HostName"
-			if i := net.ParseIP(host); i == nil {
-				cfg.ServerName = host
-			}
-		}
-
-		if scan.scanner.config.OverrideSH {
-			cfg.SignatureAndHashes = []tls.SigAndHash{
-				{0x01, 0x04}, // rsa, sha256
-				{0x03, 0x04}, // ecdsa, sha256
-				{0x01, 0x02}, // rsa, sha1
-				{0x03, 0x02}, // ecdsa, sha1
-				{0x01, 0x04}, // rsa, sha256
-				{0x01, 0x05}, // rsa, sha384
-				{0x01, 0x06}, // rsa, sha512
-			}
-		}
-		tlsConn := scan.scanner.config.TLSFlags.GetWrappedConnection(outer, cfg)
-
-		// lib/http/transport.go fills in the TLSLog in the http.Request instance(s)
-		err = tlsConn.Handshake()
-		return tlsConn, err
-	}
-}
-
-// Taken from zgrab/zlib/grabber.go -- check if the URL points to localhost
-func redirectsToLocalhost(host string) bool {
-	if i := net.ParseIP(host); i != nil {
-		return i.IsLoopback() || i.Equal(net.IPv4zero)
-	}
-	if host == "localhost" {
-		return true
-	}
-
-	if addrs, err := net.LookupHost(host); err == nil {
-		for _, i := range addrs {
-			if ip := net.ParseIP(i); ip != nil {
-				if ip.IsLoopback() || ip.Equal(net.IPv4zero) {
-					return true
-				}
-			}
-		}
-	}
-	return false
+	return ctx, func() {}
 }
 
 // Taken from zgrab/zlib/grabber.go -- get a CheckRedirect callback that uses
 // the redirectToLocalhost and MaxRedirects config
 func (scan *scan) getCheckRedirect() func(*http.Request, *http.Response, []*http.Request) error {
 	return func(req *http.Request, res *http.Response, via []*http.Request) error {
-		if !scan.scanner.config.FollowLocalhostRedirects && redirectsToLocalhost(req.URL.Hostname()) {
-			return ErrRedirLocalhost
+		if scan.scanner.config.MaxRedirects == 0 {
+			return ErrDoNotRedirect
 		}
+		//len-1 because otherwise we'll return a failure on 1 redirect when we specify only 1 redirect. I.e. we are 0
+		if len(via)-1 > scan.scanner.config.MaxRedirects {
+			return ErrTooManyRedirects
+		}
+		// We're following a re-direct. The IP that the framework resolved initially is no longer valid. Clearing
+		scan.target.IP = nil
 		scan.results.RedirectResponseChain = append(scan.results.RedirectResponseChain, res)
 		b := new(bytes.Buffer)
 		maxReadLen := int64(scan.scanner.config.MaxSize) * 1024
@@ -412,10 +329,6 @@ func (scan *scan) getCheckRedirect() func(*http.Request, *http.Response, []*http
 				m.Write(b.Bytes())
 				res.BodySHA256 = m.Sum(nil)
 			}
-		}
-
-		if len(via) > scan.scanner.config.MaxRedirects {
-			return ErrTooManyRedirects
 		}
 
 		return nil
@@ -445,43 +358,107 @@ func getHTTPURL(https bool, host string, port uint16, endpoint string) string {
 	}
 
 	//For non-default ports, net.JoinHostPort will handle brackets for IPv6 literals
-	return proto + "://" + net.JoinHostPort(host, strconv.FormatUint(uint64(port), 10)) + endpoint
+	return proto + "://" + net.JoinHostPort(host, strconv.Itoa(int(port))) + endpoint
 }
 
 // NewHTTPScan gets a new Scan instance for the given target
-func (scanner *Scanner) newHTTPScan(t *zgrab2.ScanTarget, useHTTPS bool) *scan {
+func (scanner *Scanner) newHTTPScan(ctx context.Context, target *zgrab2.ScanTarget, useHTTPS bool, dialerGroup *zgrab2.DialerGroup) *scan {
 	ret := scan{
-		scanner: scanner,
-		target:  t,
-		transport: &http.Transport{
-			Proxy:               nil, // TODO: implement proxying
-			DisableKeepAlives:   false,
-			DisableCompression:  false,
-			MaxIdleConnsPerHost: scanner.config.MaxRedirects,
-			RawHeaderBuffer:     scanner.config.RawHeaders,
-		},
-		client:         http.MakeNewClient(),
-		globalDeadline: time.Now().Add(scanner.config.Timeout),
+		scanner:                scanner,
+		target:                 target,
+		client:                 http.MakeNewClient(),
+		redirectsToResolvedIPs: make(map[string]string),
 	}
-	ret.transport.DialTLS = ret.getTLSDialer(t)
-	ret.transport.DialContext = ret.dialContext
 	ret.client.UserAgent = scanner.config.UserAgent
-	ret.client.CheckRedirect = ret.getCheckRedirect()
-	ret.client.Transport = ret.transport
-	ret.client.Jar = nil // Don't send or receive cookies (otherwise use CookieJar)
-	ret.client.Timeout = scanner.config.Timeout
-	host := t.Domain
-	if host == "" {
-		host = t.IP.String()
+	if scanner.config.TargetTimeout != 0 {
+		ret.globalDeadline = time.Now().Add(scanner.config.TargetTimeout)
 	}
-	// Scanner Target port overrides config flag port
-	var port uint16
-	if t.Port != nil {
-		port = uint16(*t.Port)
+	if len(scanner.config.NextProtos) == 0 {
+		// While we may not be using TLS for the initial connection, if the user is following redirects, we may end up at an https:// URL
+		// Setting NextProtos won't have a side effect on plain-text HTTP connections
+		if !scanner.config.NoHTTP2 && !scanner.config.NoHTTP11 {
+			// Default - advertise both HTTP/2 and HTTP/1.1
+			scanner.config.NextProtos = "h2,http/1.1"
+		} else if scanner.config.NoHTTP2 {
+			scanner.config.NextProtos = "http/1.1"
+		} else if scanner.config.NoHTTP11 {
+			scanner.config.NextProtos = "h2"
+		}
+	}
+	if !scanner.config.UseHTTPS && scanner.config.NoHTTP11 {
+		// HTTP/2 prior knowledge over cleartext TCP
+		// Use http2.Transport directly (not through http.Client’s automatic upgrade)
+		// Note - There is one case where we don't follow what the user may expect: if the user uses --no-http1.1 --use-https and hits an HTTP/2 aware server (over TLS) that re-directs to a new server using http:// (no TLS), we will use HTTP/1.1 for that re-directed request.
+		// I couldn't figure out a way to use HTTP/2 prior knowledge on re-directs where the initial request was over TLS.
+		// curl does do this, but it's unclear to me how to do this with Go's http/http2 libraries presently since you have to initialize the http2.Transport initially to support h2c and then it won't support TLS.
+		// Perhaps there's a way to multiplex between two transports to handle this case, but it seems like an edge case that's unlikely to be widely used in practice.
+		// If users complain that on re-directs they're seeing HTTP/1.1 when they expect HTTP/2, we can revisit this.
+		transport := &http2.Transport{
+			AllowHTTP: true, // allow h2c (non-TLS)
+			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+				// Instead of TLS, just do raw TCP
+				return dialerGroup.L4Dialer(target)(ctx, network, addr)
+			},
+		}
+		ret.client.Transport = transport
 	} else {
-		port = uint16(scanner.config.BaseFlags.Port)
+		// Use http.Transport, which may be automatically upgraded to HTTP/2 by http.Client
+		transport := &http.Transport{
+			Proxy:                nil, // TODO: implement proxying
+			DisableKeepAlives:    false,
+			DisableCompression:   false,
+			MaxIdleConnsPerHost:  scanner.config.MaxRedirects,
+			RawHeaderBuffer:      scanner.config.RawHeaders,
+			EnableJA4SSignatures: scanner.config.EnableJA4SSignatures,
+		}
+		transport.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			deadlineCtx, cancelFunc := ret.withDeadlineContext(ctx)
+			conn, err := dialerGroup.GetTLSDialer(deadlineCtx, target)(network, addr)
+			if err != nil {
+				return nil, fmt.Errorf("unable to dial target (%s) with TLS Dialer: %w", target.String(), err)
+			}
+			host, _, err := net.SplitHostPort(addr)
+			if err == nil && net.ParseIP(host) == nil && conn != nil && conn.RemoteAddr() != nil {
+				// addr is a domain, update our mapping of redirected URLs to resolved IPs
+				ret.redirectsToResolvedIPs[host] = conn.RemoteAddr().String()
+			}
+			ret.connections = append(ret.connections, conn)
+			ret.cancelFuncs = append(ret.cancelFuncs, cancelFunc)
+			return conn, nil
+		}
+		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			deadlineCtx, cancelFunc := ret.withDeadlineContext(ctx)
+			conn, err := dialerGroup.L4Dialer(target)(deadlineCtx, network, addr)
+			if err != nil {
+				return nil, fmt.Errorf("unable to dial target (%s) with L4 Dialer: %w", target.String(), err)
+			}
+			host, _, err := net.SplitHostPort(addr)
+			if err == nil && net.ParseIP(host) == nil && conn != nil && conn.RemoteAddr() != nil {
+				// addr is a domain, update our mapping of redirected URLs to resolved IPs
+				ret.redirectsToResolvedIPs[host] = conn.RemoteAddr().String()
+			}
+			ret.connections = append(ret.connections, conn)
+			ret.cancelFuncs = append(ret.cancelFuncs, cancelFunc)
+			return conn, nil
+		}
+		_, err := http2.ConfigureTransports(transport)
+		if err != nil {
+			log.Errorf("unable to configure http2 transport: %v", err)
+		}
+		ret.client.Transport = transport
 	}
-	ret.url = getHTTPURL(useHTTPS, host, port, scanner.config.Endpoint)
+
+	ret.client.CheckRedirect = ret.getCheckRedirect()
+	ret.client.Jar = nil // Don't send or receive cookies (otherwise use CookieJar)
+	if deadline, ok := ctx.Deadline(); ok {
+		ret.client.Timeout = min(ret.client.Timeout, time.Until(deadline))
+	}
+
+	host := target.Domain
+	if host == "" {
+		host = target.IP.String()
+	}
+	ret.url = getHTTPURL(useHTTPS, host, uint16(target.Port), scanner.config.Endpoint)
 
 	return &ret
 }
@@ -505,6 +482,8 @@ func (scan *scan) Grab() *zgrab2.ScanError {
 		return zgrab2.NewScanError(zgrab2.SCAN_UNKNOWN_ERROR, err)
 	}
 
+	request.SkipHost = scan.scanner.config.SkipHost
+
 	// By default, the following headers are *always* set:
 	// Host, User-Agent, Accept, Accept-Encoding
 	if scan.scanner.customHeaders != nil {
@@ -518,19 +497,28 @@ func (scan *scan) Grab() *zgrab2.ScanError {
 		request.Header.Set("Accept", "*/*")
 	}
 
+	if !scan.scanner.config.UseHTTPS && scan.scanner.config.NoHTTP11 {
+		// Set Protocol to HTTP/2.0 for h2c requests. This happens implicitly with the http2 transport, but this way the
+		// user sees this reflecting in the request's protocol in the json output
+		request.Proto = "HTTP/2.0"
+		request.ProtoMajor = 2
+		request.ProtoMinor = 0
+	}
+
 	resp, err := scan.client.Do(request)
 	if resp != nil && resp.Body != nil {
 		defer resp.Body.Close()
 	}
 	scan.results.Response = resp
 	if err != nil {
-		if urlError, ok := err.(*url.Error); ok {
+		var urlError *url.Error
+		if errors.As(err, &urlError) {
 			err = urlError.Err
 		}
 	}
 	if err != nil {
 		switch err {
-		case ErrRedirLocalhost:
+		case ErrDoNotRedirect:
 			break
 		case ErrTooManyRedirects:
 			if scan.scanner.config.RedirectsSucceed {
@@ -548,7 +536,10 @@ func (scan *scan) Grab() *zgrab2.ScanError {
 	if resp.ContentLength >= 0 && resp.ContentLength < maxReadLen {
 		readLen = resp.ContentLength
 	}
-	io.CopyN(buf, resp.Body, readLen)
+	if n, err := io.CopyN(buf, resp.Body, readLen); err != nil && !strings.Contains(err.Error(), "EOF") {
+		return zgrab2.NewScanError(zgrab2.SCAN_UNKNOWN_ERROR, fmt.Errorf("error populating response body after %d bytes: %w", n, err))
+	}
+
 	encoder, encoding, certain := charset.DetermineEncoding(buf.Bytes(), resp.Header.Get("content-type"))
 
 	bodyText := ""
@@ -570,7 +561,8 @@ func (scan *scan) Grab() *zgrab2.ScanError {
 	}
 
 	// Application-specific logic for retrying HTTP as HTTPS; if condition matches, return protocol error
-	if scan.scanner.config.FailHTTPToHTTPS && scan.results.Response.StatusCode == 400 && readLen < 1024 && readLen > 24 {
+	bodyTextLen := int64(len(bodyText))
+	if scan.scanner.config.FailHTTPToHTTPS && scan.results.Response.StatusCode == 400 && bodyTextLen < 1024 && bodyTextLen > 24 {
 		// Apache: "You're speaking plain HTTP to an SSL-enabled server port"
 		// NGINX: "The plain HTTP request was sent to HTTPS port"
 		var sliceLen int64 = 128
@@ -578,7 +570,6 @@ func (scan *scan) Grab() *zgrab2.ScanError {
 			sliceLen = readLen
 		}
 
-		bodyTextLen := int64(len(bodyText))
 		if bodyTextLen < sliceLen {
 			sliceLen = bodyTextLen
 		}
@@ -588,7 +579,7 @@ func (scan *scan) Grab() *zgrab2.ScanError {
 			strings.Contains(sliceBuf, "You're speaking plain HTTP") ||
 			strings.Contains(sliceBuf, "combination of host and port requires TLS") ||
 			strings.Contains(sliceBuf, "Client sent an HTTP request to an HTTPS server") {
-			return zgrab2.NewScanError(zgrab2.SCAN_PROTOCOL_ERROR, errors.New("NGINX or Apache HTTP over HTTPS failure"))
+			return zgrab2.NewScanError(zgrab2.SCAN_PROTOCOL_ERROR, ErrHTTPSProtocolMismatch)
 		}
 	}
 
@@ -613,50 +604,68 @@ func (scan *scan) Grab() *zgrab2.ScanError {
 		}
 	}
 
+	// Check if the BodyText is binary, we'll need to base64 encode it
+	// This occurs after length enforcement, since readLen is the size of data read on the wire, not encoded
+	if !utf8.ValidString(scan.results.Response.BodyText) {
+		// body isn't valid UTF-8, so we need to base64 encode it
+		// without this, binary data gets set as
+		scan.results.Response.BodyText = base64.StdEncoding.EncodeToString([]byte(scan.results.Response.BodyText))
+	}
 	return nil
+}
+
+// shouldRetryOverHTTPS decides whether a failed plaintext-HTTP scan should be
+// re-attempted over HTTPS, given the configured flags and the error Grab()
+// returned. Two flags can independently justify an HTTPS retry:
+//
+//   - RetryHTTPS: retry on ANY initial failure. Broad and connection-expensive,
+//     since every failed HTTP scan triggers a second TLS attempt.
+//   - FailHTTPToHTTPS: retry ONLY when we have positive evidence the server is
+//     actually speaking HTTPS -- i.e. Grab() returned ErrHTTPSProtocolMismatch
+//     for a known Apache/NGINX HTTP/400 protocol-mismatch response.
+//
+// In all cases there is nothing to upgrade to if we already connected over TLS.
+func (scanner *Scanner) shouldRetryOverHTTPS(err *zgrab2.ScanError) bool {
+	if scanner.config.UseHTTPS {
+		return false
+	}
+	// RetryHTTPS retries on any initial failure.
+	if scanner.config.RetryHTTPS {
+		return true
+	}
+	// FailHTTPToHTTPS stays targeted: retry only on the proven protocol mismatch.
+	return scanner.config.FailHTTPToHTTPS && errors.Is(err.Err, ErrHTTPSProtocolMismatch)
 }
 
 // Scan implements the zgrab2.Scanner interface and performs the full scan of
 // the target. If the scanner is configured to follow redirects, this may entail
 // multiple TCP connections to hosts other than target.
 func (scanner *Scanner) Scan(t zgrab2.ScanTarget) (zgrab2.ScanStatus, interface{}, error) {
-	var (
-		err  *zgrab2.ScanError
-		scan *scan
-	)
-
-	for i := 0; i < scanner.config.MaxTries; i++ {
-		scan = scanner.newHTTPScan(&t, scanner.config.UseHTTPS)
-		defer scan.Cleanup()
-		err = scan.Grab()
-		if err != nil {
-			if scanner.config.RetryHTTPS && !scanner.config.UseHTTPS {
-				scan.Cleanup()
-				retry := scanner.newHTTPScan(&t, true)
-				defer retry.Cleanup()
-				retryError := retry.Grab()
-				if retryError != nil {
-					continue
-				}
-				return zgrab2.SCAN_SUCCESS, &retry.results, nil
-			}
-			continue
-		}
-		return zgrab2.SCAN_SUCCESS, &scan.results, nil
-	}
+	scan := scanner.newHTTPScan(&t, scanner.config.UseHTTPS)
+	defer scan.Cleanup()
+	err := scan.Grab()
 	if err != nil {
+		if scanner.config.RetryHTTPS && !scanner.config.UseHTTPS {
+			scan.Cleanup()
+			retry := scanner.newHTTPScan(&t, true)
+			defer retry.Cleanup()
+			retryError := retry.Grab()
+			if retryError != nil {
+				return err.Unpack(&scan.results)
+			}
+			return zgrab2.SCAN_SUCCESS, &retry.results, nil
+		}
 		return err.Unpack(&scan.results)
 	}
-	return zgrab2.SCAN_SUCCESS, &scan.results, nil
-}
-
-// RegisterModule is called by modules/http.go to register this module with the
-// zgrab2 framework.
-func RegisterModule() {
-	var module Module
-
-	_, err := zgrab2.AddCommand("http", "HTTP Banner Grab", module.Description(), 80, &module)
-	if err != nil {
-		log.Fatal(err)
+	// Copy over the resolved names to IPs
+	if len(scan.redirectsToResolvedIPs) > 0 {
+		scan.results.NamesToIPs = make([]RedirectToIP, 0, len(scan.redirectsToResolvedIPs))
+		for k, v := range scan.redirectsToResolvedIPs {
+			scan.results.NamesToIPs = append(scan.results.NamesToIPs, RedirectToIP{
+				RedirectName: k,
+				IP:           v,
+			})
+		}
 	}
+	return zgrab2.SCAN_SUCCESS, &scan.results, nil
 }

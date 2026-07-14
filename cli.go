@@ -1,0 +1,111 @@
+package zgrab2
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+
+	log "github.com/sirupsen/logrus"
+	flags "github.com/zmap/zflags"
+)
+
+var (
+	parser *flags.Parser // parser for main zgrab2 command
+	// iniParser is a parser just for ini files. It's frustrating that we need both, but the ini parser needs an option
+	// group 'Application Options' and it seems we can't have this along with option groups in the main parser and have
+	// options set correctly. The hidden one shadows the other and no CLI flags are set.
+	iniParser *flags.Parser
+)
+
+const defaultDNSPort = "53"
+
+func init() {
+	parser = flags.NewParser(nil, flags.Default)
+	desc := []string{
+		// Using a long single line so the terminal can handle wrapping, except for Input/Examples which should be on
+		// separate lines
+		"zgrab2 is fast, modular L7 application-layer scanner. It is commonly used with tools like ZMap which identify " +
+			"\"potential services\", or services we know are active on a given IP + port, and these are fed into ZGrab2 " +
+			"to confirm and provide details of the service. It has support for a number of protocols listed below as " +
+			"'Available commands' including SSH and HTTP. By default, zgrab2 will accept input from stdin and output " +
+			"results to stdout, with updates and logs to stderr. Please see 'zgrab2 <command> --help' for more details " +
+			"on a specific command.",
+		"Input is taken from stdin or --input-file, if specified. Input is CSV-formatted with 'IP, Domain, Tag, Port' " +
+			"or simply 'IP' or 'Domain'. See README.md for more details.",
+		"",
+		"Example usages:",
+		"echo '1.1.1.1' | zgrab2 tls        # Scan 1.1.1.1 with TLS",
+		"echo example.com | zgrab2 http     # Scan example.com with HTTP",
+	}
+	parser.LongDescription = strings.Join(desc, "\n")
+	_, err := parser.AddCommand("multiple", "Run multiple commands in a single run", "", &config.Multiple)
+	if err != nil {
+		log.Fatalf("could not add multiple command: %v", err)
+	}
+	_, err = parser.AddGroup("General Options", "General options for controlling the behavior of ZGrab2", &config.GeneralOptions)
+	if err != nil {
+		log.Fatalf("could not add general options group: %v", err)
+	}
+	_, err = parser.AddGroup("Input/Output Options", "Options for controlling the input/output behavior of ZGrab2", &config.InputOutputOptions)
+	if err != nil {
+		log.Fatalf("could not add I/O options group: %v", err)
+	}
+	_, err = parser.AddGroup("Network Options", "Options for controlling the network behavior of ZGrab2", &config.NetworkingOptions)
+	if err != nil {
+		log.Fatalf("could not add networking options group: %v", err)
+	}
+	iniParser = flags.NewParser(nil, flags.Default)
+}
+
+// NewIniParser creates and returns a ini parser initialized
+// with the default parser
+func NewIniParser() *flags.IniParser {
+	group, err := iniParser.AddGroup("Application Options", "Hidden group including all global options for ini files", &config)
+	if err != nil {
+		log.Fatalf("could not add Application Options group: %v", err)
+	}
+	group.Hidden = true
+
+	newIniParser := flags.NewIniParser(iniParser)
+	newIniParser.NoValidateAfterParsing = true
+	return newIniParser
+}
+
+// RegisterModule registers a module with the CLI parsers. Fatal on error.
+func RegisterModule(m Module) {
+	if _, err := AddCommand(m); err != nil {
+		log.Fatal(err)
+	}
+}
+
+// AddCommand registers a module with the CLI parsers and returns the resulting
+// command object. Use this instead of RegisterModule when you need to customize
+// the command after registration (e.g. overriding flag defaults).
+func AddCommand(m Module) (*flags.Command, error) {
+	cmd, err := parser.AddCommand(m.Protocol(), m.ShortDescription(), m.Description(), m)
+	if err != nil {
+		return nil, fmt.Errorf("could not add command to default parser: %w", err)
+	}
+	cmd.FindOptionByLongName("port").Default = []string{strconv.Itoa(m.DefaultPort())}
+	cmd.FindOptionByLongName("name").Default = []string{m.Protocol()}
+
+	// Add the same command to the ini parser; discard this cmd since we return
+	// the parser cmd above so callers can customize options on the CLI parser.
+	iniCmd, err := iniParser.AddCommand(m.Protocol(), m.ShortDescription(), m.Description(), m)
+	if err != nil {
+		return nil, fmt.Errorf("could not add command to ini parser: %w", err)
+	}
+	iniCmd.FindOptionByLongName("port").Default = []string{strconv.Itoa(m.DefaultPort())}
+	iniCmd.FindOptionByLongName("name").Default = []string{m.Protocol()}
+	modules[m.Protocol()] = m
+	return cmd, nil
+}
+
+// ParseCommandLine parses the commands given on the command line
+// and validates the framework configuration (global options)
+// immediately after parsing
+func ParseCommandLine(flags []string) ([]string, string, ScanFlags, error) {
+	posArgs, moduleType, f, err := parser.ParseCommandLine(flags)
+	sf, _ := f.(ScanFlags)
+	return posArgs, moduleType, sf, err
+}
